@@ -1,88 +1,99 @@
 # ============================================================
-# SSAFY-Agent v0
+# SSAFY-Agent v1
 #
-# InternVL3.5-4B + Rule Router + YOLO Visual Tools
+# InternVL3.5-4B-Flash
+# + Cached Vision Features
+# + QLoRA on Language Model Only
+# + Rule Router
+# + General YOLO
+# + Recycling Material YOLO
+# + Crop / Zoom
 #
-# ------------------------------------------------------------
-# MAIN MODEL
-# ------------------------------------------------------------
-# - OpenGVLab/InternVL3_5-4B
-# - 4-bit NF4 QLoRA
-# - Language LoRA only
-# - r=16 / alpha=32
-# - LR=1e-4
-# - 1 epoch
-# - Gold train 90% / validation 10%
+# ============================================================
 #
-# ------------------------------------------------------------
-# TOOLS — inference only
-# ------------------------------------------------------------
-# 1. General YOLO
-#    - object
-#    - bbox
-#    - count
-#    - position
+# TRAIN PIPELINE
 #
-# 2. Recycling Material YOLO
-#    - plastic
-#    - glass
-#    - metal
-#    - paper
-#    - etc.
-#
-# 3. Crop / Zoom
-#    - YOLO bbox 확대
-#
-# 4. Rule Router
-#    - question type
-#    - InternVL confidence
+# image
+#   ↓
+# InternVL-Flash Vision Encoder      [ONCE]
+#   ↓
+# vision embedding
+#   ↓
+# disk cache (.pt)
 #
 # ------------------------------------------------------------
-# PIPELINE
+#
+# cached vision embedding
+#       +
+# question / options
+#       ↓
+# Qwen3 inner language model
+#       ↓
+# LoRA
+#
+# Vision Encoder is NOT executed during training.
+#
 # ------------------------------------------------------------
 #
-# Image + Question
-#        ↓
+# INFERENCE
+#
+# Cached image feature
+#       ↓
 # InternVL First Pass
-#        ↓
-# confidence + question
-#        ↓
+#       ↓
+# confidence + question type
+#       ↓
 # Rule Router
-#        ↓
-# YOLO tools (if needed)
-#        ↓
-# structured evidence + crop
-#        ↓
+#       ↓
+# General YOLO / Material YOLO
+#       ↓
+# optional crops
+#       ↓
+# Vision encoder ONLY for new crops
+#       ↓
 # InternVL Second Pass
-#        ↓
-# a / b / c / d
 #
 # ============================================================
 
 
 # ============================================================
-# 0. Required packages
+# 0. Requirements
 # ============================================================
 #
-# pip install -U transformers accelerate bitsandbytes peft
-# pip install -U ultralytics huggingface_hub
-# pip install -U scikit-learn pandas pillow tqdm
+# python -m pip install -U \
+# transformers accelerate bitsandbytes peft \
+# torch torchvision einops timm \
+# ultralytics huggingface_hub \
+# scikit-learn pandas pillow tqdm
+#
+# InternVL3.5 recommends transformers >= 4.52.1
 #
 # ============================================================
 
 
-import gc
+# ============================================================
+# 1. Imports
+# ============================================================
+
+import copy
+import json
 import math
 import random
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, List, Dict
 
 import pandas as pd
-
 from PIL import Image
 
 import torch
+import torch.nn as nn
+
+import torchvision.transforms as T
+
+from torchvision.transforms.functional import (
+    InterpolationMode,
+)
 
 from torch.utils.data import (
     Dataset,
@@ -94,8 +105,8 @@ from sklearn.model_selection import (
 )
 
 from transformers import (
-    AutoModelForImageTextToText,
-    AutoProcessor,
+    AutoModel,
+    AutoTokenizer,
     BitsAndBytesConfig,
     get_linear_schedule_with_warmup,
 )
@@ -110,34 +121,80 @@ from ultralytics import YOLO
 
 from huggingface_hub import (
     hf_hub_download,
-    list_repo_files,
 )
 
 from tqdm.auto import tqdm
 
 
 # ============================================================
-# 1. Project
+# 2. Project
 # ============================================================
 
 try:
-    PROJECT_DIR = Path(__file__).resolve().parent
+    PROJECT_DIR = (
+        Path(__file__)
+        .resolve()
+        .parent
+    )
 
 except NameError:
-    PROJECT_DIR = Path.cwd().resolve()
+    PROJECT_DIR = (
+        Path.cwd()
+        .resolve()
+    )
 
 
 # ============================================================
-# 2. Core config
+# 3. Model
 # ============================================================
+
+MODEL_ID = (
+    "OpenGVLab/InternVL3_5-4B-Flash"
+)
 
 SEED = 42
 
-MODEL_ID = "OpenGVLab/InternVL3_5-4B"
+
+# ============================================================
+# 4. Vision
+# ============================================================
+
+IMAGE_SIZE = 448
+
+# 핵심:
+# dynamic high-resolution을 사용하지 않고
+# 우선 정확히 1 tile만 사용한다.
+#
+# 이전 실행:
+# batch=2인데 tiles=10
+#
+# 현재:
+# batch=2 → tiles=2
+
+TRAIN_MAX_TILES = 1
+
+INFER_MAX_TILES = 1
+
+CROP_MAX_TILES = 1
 
 
 # ============================================================
-# 3. Training config
+# 5. Feature Cache
+# ============================================================
+
+FEATURE_CACHE_DIR = (
+    PROJECT_DIR
+    / "feature_cache"
+    / "internvl3_5_4b_flash_tile1"
+)
+
+CACHE_DTYPE = torch.float16
+
+REBUILD_FEATURE_CACHE = False
+
+
+# ============================================================
+# 6. Training
 # ============================================================
 
 NUM_EPOCHS = 1
@@ -151,19 +208,24 @@ WARMUP_RATIO = 0.03
 MAX_GRAD_NORM = 1.0
 
 
-# ------------------------------------------------------------
-# 3090 Ti 24GB
-# ------------------------------------------------------------
+# ============================================================
+# 7. Batch
+# ============================================================
 
-TRAIN_BATCH_SIZE = 2
+# Vision encoder가 학습 loop에서 사라지므로
+# 이전보다 batch를 키울 여지가 있음.
+#
+# 우선 보수적으로 시작.
 
-GRAD_ACCUM = 8
+TRAIN_BATCH_SIZE = 4
 
-EVAL_BATCH_SIZE = 4
+GRAD_ACCUM = 4
+
+# effective batch = 16
 
 
 # ============================================================
-# 4. LoRA
+# 8. LoRA
 # ============================================================
 
 LORA_R = 16
@@ -174,7 +236,7 @@ LORA_DROPOUT = 0.05
 
 
 # ============================================================
-# 5. Tool config
+# 9. YOLO tools
 # ============================================================
 
 USE_GENERAL_YOLO = True
@@ -184,58 +246,34 @@ USE_MATERIAL_YOLO = True
 USE_CROP_TOOL = True
 
 
-# ------------------------------------------------------------
-# General YOLO
-#
-# 최초 실행 시 Ultralytics weight 다운로드 가능.
-# 추론 자체는 로컬 GPU에서 수행.
-# ------------------------------------------------------------
-
-GENERAL_YOLO_MODEL = "yolov8l.pt"
+GENERAL_YOLO_MODEL = (
+    "yolov8l.pt"
+)
 
 GENERAL_YOLO_CONF = 0.25
 
 GENERAL_YOLO_IMGSZ = 640
 
 
-# ------------------------------------------------------------
-# Material YOLO
-#
-# Hugging Face의 공개 recycling/material YOLO 저장소.
-#
-# repo 내 .pt checkpoint를 자동 탐색한다.
-#
-# 저장소를 다른 recycling YOLO로 교체해도 됨.
-# ------------------------------------------------------------
-
-MATERIAL_YOLO_REPO = (
-    "CatSat/yolov11-litter-materials"
+MATERIAL_REPO = (
+    "Jeremy341/MIRA-AI"
 )
 
-MATERIAL_YOLO_CONF = 0.20
+MATERIAL_FILENAME = (
+    "mira_exp019.pt"
+)
+
+MATERIAL_YOLO_CONF = 0.25
 
 MATERIAL_YOLO_IMGSZ = 640
 
 
-# ------------------------------------------------------------
-# Router
-#
-# first-pass top1 - top2 logit margin
-#
-# 낮으면 tool을 사용.
-# ------------------------------------------------------------
+# ============================================================
+# 10. Router
+# ============================================================
 
-ROUTER_MARGIN_THRESHOLD = 0.80
-
-
-# ------------------------------------------------------------
-# validation에서 threshold 탐색할 후보
-# ------------------------------------------------------------
-
-CALIBRATE_ROUTER_THRESHOLD = True
-
-ROUTER_THRESHOLD_CANDIDATES = [
-    0.0,
+ROUTER_THRESHOLDS = [
+    0.00,
     0.25,
     0.50,
     0.75,
@@ -245,30 +283,34 @@ ROUTER_THRESHOLD_CANDIDATES = [
 ]
 
 
-# ------------------------------------------------------------
-# Crop
-#
-# bbox 주변을 조금 넓혀 자른다.
-# ------------------------------------------------------------
+# ============================================================
+# 11. Crop
+# ============================================================
 
 CROP_PADDING_RATIO = 0.12
 
-MAX_CROPS_PER_SAMPLE = 2
+MAX_CROPS = 2
 
 
 # ============================================================
-# 6. Paths
+# 12. Paths
 # ============================================================
 
-TRAIN_CSV = PROJECT_DIR / "train.csv"
+TRAIN_CSV = (
+    PROJECT_DIR
+    / "train.csv"
+)
 
-TEST_CSV = PROJECT_DIR / "test.csv"
+TEST_CSV = (
+    PROJECT_DIR
+    / "test.csv"
+)
 
 
 SAVE_DIR = (
     PROJECT_DIR
     / "model"
-    / "internvl3_5_4b_agent"
+    / "internvl3_5_4b_flash_agent"
 )
 
 
@@ -278,35 +320,32 @@ SUBMISSION_DIR = (
 )
 
 
-SUBMISSION_PATH = (
+BASELINE_SUBMISSION_PATH = (
     SUBMISSION_DIR
-    / "submission_internvl_agent.csv"
+    / "submission_internvl_flash_baseline.csv"
 )
 
 
-BASELINE_SUBMISSION_PATH = (
+AGENT_SUBMISSION_PATH = (
     SUBMISSION_DIR
-    / "submission_internvl_baseline.csv"
+    / "submission_internvl_flash_agent.csv"
 )
 
 
 VALIDATION_PATH = (
     SUBMISSION_DIR
-    / "internvl_agent_validation.csv"
+    / "internvl_flash_validation.csv"
 )
 
 
 TOOL_LOG_PATH = (
     SUBMISSION_DIR
-    / "internvl_agent_tool_log.csv"
+    / "internvl_flash_tool_log.csv"
 )
 
 
-Image.MAX_IMAGE_PIXELS = None
-
-
 # ============================================================
-# 7. Reproducibility / CUDA
+# 13. CUDA / Seed
 # ============================================================
 
 random.seed(SEED)
@@ -332,15 +371,19 @@ DEVICE = torch.device(
 
 
 COMPUTE_DTYPE = (
+
     torch.bfloat16
+
     if torch.cuda.is_bf16_supported()
+
     else torch.float16
 )
 
 
 USE_SCALER = (
     COMPUTE_DTYPE
-    == torch.float16
+    ==
+    torch.float16
 )
 
 
@@ -350,18 +393,23 @@ print(
 )
 
 print(
+    "Model:",
+    MODEL_ID
+)
+
+print(
     "GPU:",
     torch.cuda.get_device_name(0)
 )
 
 print(
-    "dtype:",
+    "Compute dtype:",
     COMPUTE_DTYPE
 )
 
 
 # ============================================================
-# 8. Choices
+# 14. Choices
 # ============================================================
 
 CHOICES = (
@@ -372,21 +420,17 @@ CHOICES = (
 )
 
 
-CHOICE_TO_INDEX = {
-    c: i
-    for i, c
-    in enumerate(CHOICES)
-}
-
-
 VALID_CHOICES = set(
     CHOICES
 )
 
 
 # ============================================================
-# 9. Image helpers
+# 15. Image helpers
 # ============================================================
+
+Image.MAX_IMAGE_PIXELS = None
+
 
 def resolve_image_path(
     value,
@@ -396,12 +440,14 @@ def resolve_image_path(
         str(value)
     )
 
+
     if not path.is_absolute():
 
         path = (
             PROJECT_DIR
             / path
         )
+
 
     return path
 
@@ -414,6 +460,7 @@ def load_rgb_image(
         value
     )
 
+
     with Image.open(
         path
     ) as image:
@@ -423,28 +470,355 @@ def load_rgb_image(
         )
 
 
-def autocast_context():
+# ============================================================
+# 16. InternVL Image Transform
+# ============================================================
 
-    return torch.autocast(
-        device_type="cuda",
-        dtype=COMPUTE_DTYPE,
-    )
+IMAGENET_MEAN = (
+    0.485,
+    0.456,
+    0.406,
+)
 
 
-def sanitize_inputs(
-    inputs,
-):
+IMAGENET_STD = (
+    0.229,
+    0.224,
+    0.225,
+)
 
-    inputs.pop(
-        "token_type_ids",
-        None,
-    )
 
-    return inputs
+IMAGE_TRANSFORM = T.Compose(
+    [
+        T.Lambda(
+            lambda image:
+                image.convert("RGB")
+                if image.mode != "RGB"
+                else image
+        ),
+
+        T.Resize(
+            (
+                IMAGE_SIZE,
+                IMAGE_SIZE,
+            ),
+
+            interpolation=(
+                InterpolationMode.BICUBIC
+            ),
+        ),
+
+        T.ToTensor(),
+
+        T.Normalize(
+            mean=IMAGENET_MEAN,
+            std=IMAGENET_STD,
+        ),
+    ]
+)
 
 
 # ============================================================
-# 10. Dataset
+# 17. Dynamic preprocessing
+#
+# tile=1에서는 사실상:
+#
+# original → 448x448
+#
+# 이지만 나중에 tile 값을 다시 늘릴 수 있게
+# InternVL 형태는 유지한다.
+# ============================================================
+
+def find_closest_aspect_ratio(
+    aspect_ratio,
+    target_ratios,
+    width,
+    height,
+    image_size,
+):
+
+    best_diff = float(
+        "inf"
+    )
+
+    best_ratio = (
+        1,
+        1,
+    )
+
+
+    area = (
+        width
+        *
+        height
+    )
+
+
+    for ratio in (
+        target_ratios
+    ):
+
+        target_aspect = (
+            ratio[0]
+            /
+            ratio[1]
+        )
+
+
+        diff = abs(
+            aspect_ratio
+            -
+            target_aspect
+        )
+
+
+        if diff < best_diff:
+
+            best_diff = (
+                diff
+            )
+
+            best_ratio = (
+                ratio
+            )
+
+
+        elif diff == best_diff:
+
+            if (
+                area
+                >
+                0.5
+                *
+                image_size
+                *
+                image_size
+                *
+                ratio[0]
+                *
+                ratio[1]
+            ):
+
+                best_ratio = (
+                    ratio
+                )
+
+
+    return best_ratio
+
+
+def dynamic_preprocess(
+    image,
+    min_num=1,
+    max_num=1,
+    image_size=448,
+    use_thumbnail=True,
+):
+
+    width, height = (
+        image.size
+    )
+
+
+    aspect_ratio = (
+        width
+        /
+        height
+    )
+
+
+    target_ratios = set()
+
+
+    for n in range(
+        min_num,
+        max_num + 1,
+    ):
+
+        for i in range(
+            1,
+            n + 1,
+        ):
+
+            for j in range(
+                1,
+                n + 1,
+            ):
+
+                blocks = (
+                    i * j
+                )
+
+
+                if (
+                    min_num
+                    <= blocks
+                    <= max_num
+                ):
+
+                    target_ratios.add(
+                        (
+                            i,
+                            j,
+                        )
+                    )
+
+
+    target_ratios = sorted(
+
+        target_ratios,
+
+        key=lambda x:
+            x[0]
+            *
+            x[1],
+    )
+
+
+    target_ratio = (
+        find_closest_aspect_ratio(
+
+            aspect_ratio,
+
+            target_ratios,
+
+            width,
+
+            height,
+
+            image_size,
+        )
+    )
+
+
+    target_width = (
+        image_size
+        *
+        target_ratio[0]
+    )
+
+
+    target_height = (
+        image_size
+        *
+        target_ratio[1]
+    )
+
+
+    blocks = (
+        target_ratio[0]
+        *
+        target_ratio[1]
+    )
+
+
+    resized = image.resize(
+        (
+            target_width,
+            target_height,
+        ),
+
+        Image.Resampling.BICUBIC,
+    )
+
+
+    tiles_per_row = (
+        target_width
+        //
+        image_size
+    )
+
+
+    output = []
+
+
+    for index in range(
+        blocks
+    ):
+
+        x = (
+            index
+            %
+            tiles_per_row
+        )
+
+
+        y = (
+            index
+            //
+            tiles_per_row
+        )
+
+
+        box = (
+            x * image_size,
+            y * image_size,
+            (x + 1) * image_size,
+            (y + 1) * image_size,
+        )
+
+
+        output.append(
+            resized.crop(
+                box
+            )
+        )
+
+
+    if (
+        use_thumbnail
+        and
+        len(output) != 1
+    ):
+
+        output.append(
+
+            image.resize(
+                (
+                    image_size,
+                    image_size,
+                ),
+
+                Image.Resampling.BICUBIC,
+            )
+        )
+
+
+    return output
+
+
+def preprocess_image(
+    image,
+    max_num,
+):
+
+    tiles = dynamic_preprocess(
+
+        image,
+
+        min_num=1,
+
+        max_num=max_num,
+
+        image_size=IMAGE_SIZE,
+
+        use_thumbnail=True,
+    )
+
+
+    return torch.stack(
+        [
+            IMAGE_TRANSFORM(
+                tile
+            )
+
+            for tile in tiles
+        ]
+    )
+
+
+# ============================================================
+# 18. Dataset load
 # ============================================================
 
 train_df = pd.read_csv(
@@ -457,7 +831,7 @@ test_df = pd.read_csv(
 )
 
 
-TRAIN_REQUIRED = {
+TRAIN_COLUMNS = {
     "id",
     "path",
     "question",
@@ -469,7 +843,7 @@ TRAIN_REQUIRED = {
 }
 
 
-TEST_REQUIRED = {
+TEST_COLUMNS = {
     "id",
     "path",
     "question",
@@ -480,7 +854,7 @@ TEST_REQUIRED = {
 }
 
 
-def require_columns(
+def check_columns(
     df,
     required,
     name,
@@ -488,65 +862,103 @@ def require_columns(
 
     missing = (
         required
-        - set(df.columns)
+        -
+        set(
+            df.columns
+        )
     )
+
 
     if missing:
 
-        raise ValueError(
-            f"{name}: missing "
+        raise RuntimeError(
+            f"{name} missing columns: "
             f"{sorted(missing)}"
         )
 
 
-require_columns(
+check_columns(
     train_df,
-    TRAIN_REQUIRED,
+    TRAIN_COLUMNS,
     "train.csv",
 )
 
 
-require_columns(
+check_columns(
     test_df,
-    TEST_REQUIRED,
+    TEST_COLUMNS,
     "test.csv",
 )
 
 
+answers = (
+
+    train_df[
+        "answer"
+    ]
+
+    .astype(str)
+
+    .str.strip()
+
+    .str.lower()
+)
+
+
+if not set(
+    answers.unique()
+).issubset(
+    VALID_CHOICES
+):
+
+    raise RuntimeError(
+        "Invalid train labels."
+    )
+
+
 # ============================================================
-# 11. Split
+# 19. Split
 # ============================================================
 
 train_subset, valid_subset = (
     train_test_split(
+
         train_df,
 
         test_size=0.10,
 
         random_state=SEED,
 
-        stratify=train_df[
-            "answer"
-        ],
+        stratify=(
+            train_df[
+                "answer"
+            ]
+        ),
     )
 )
 
 
 train_subset = (
     train_subset
-    .reset_index(drop=True)
+    .reset_index(
+        drop=True
+    )
 )
 
 
 valid_subset = (
     valid_subset
-    .reset_index(drop=True)
+    .reset_index(
+        drop=True
+    )
 )
 
 
 test_df = (
     test_df
-    .reset_index(drop=True)
+    .reset_index(
+        drop=True
+    )
 )
 
 
@@ -571,35 +983,42 @@ print(
 
 
 # ============================================================
-# 12. InternVL Processor
+# 20. Tokenizer
+#
+# Native InternVL tokenizer.
+# No AutoProcessor.
 # ============================================================
 
-processor = (
-    AutoProcessor.from_pretrained(
+tokenizer = (
+    AutoTokenizer
+    .from_pretrained(
+
         MODEL_ID,
 
         trust_remote_code=True,
+
+        use_fast=False,
     )
 )
 
 
-processor.tokenizer.padding_side = (
+tokenizer.padding_side = (
     "left"
 )
 
 
 if (
-    processor.tokenizer.pad_token_id
+    tokenizer.pad_token_id
     is None
 ):
 
-    processor.tokenizer.pad_token = (
-        processor.tokenizer.eos_token
+    tokenizer.pad_token = (
+        tokenizer.eos_token
     )
 
 
 # ============================================================
-# 13. InternVL 4-bit model
+# 21. Load Flash model
 # ============================================================
 
 bnb_config = (
@@ -619,10 +1038,14 @@ bnb_config = (
 
 
 model = (
-    AutoModelForImageTextToText
+    AutoModel
     .from_pretrained(
 
         MODEL_ID,
+
+        trust_remote_code=True,
+
+        low_cpu_mem_usage=True,
 
         quantization_config=(
             bnb_config
@@ -632,46 +1055,146 @@ model = (
             "": 0
         },
 
-        trust_remote_code=True,
+        use_flash_attn=False,
     )
 )
 
 
-model.config.use_cache = False
+# ============================================================
+# 22. Structure checks
+# ============================================================
 
+for attr in [
+    "vision_model",
+    "language_model",
+    "mlp1",
+    "conv_template",
+]:
 
-model = (
-    prepare_model_for_kbit_training(
-
+    if not hasattr(
         model,
+        attr,
+    ):
 
-        use_gradient_checkpointing=True,
+        raise RuntimeError(
+            f"Unexpected InternVL Flash structure: "
+            f"missing {attr}"
+        )
+
+
+if not hasattr(
+    model,
+    "extract_feature",
+):
+
+    raise RuntimeError(
+        "This InternVL Flash checkpoint "
+        "does not expose extract_feature()."
+    )
+
+
+print(
+    "\n===== INTERNVL FLASH ====="
+)
+
+print(
+    "Outer:",
+    type(
+        model
+    ).__name__
+)
+
+print(
+    "Vision:",
+    type(
+        model.vision_model
+    ).__name__
+)
+
+print(
+    "Language:",
+    type(
+        model.language_model
+    ).__name__
+)
+
+print(
+    "extract_feature(): OK"
+)
+
+
+# ============================================================
+# 23. Special tokens
+# ============================================================
+
+IMG_START_TOKEN = (
+    "<img>"
+)
+
+IMG_END_TOKEN = (
+    "</img>"
+)
+
+IMG_CONTEXT_TOKEN = (
+    "<IMG_CONTEXT>"
+)
+
+
+IMG_CONTEXT_ID = (
+    tokenizer.convert_tokens_to_ids(
+        IMG_CONTEXT_TOKEN
     )
 )
 
 
-# ============================================================
-# 14. Language-only LoRA
-# ============================================================
+if (
+    IMG_CONTEXT_ID is None
 
-TARGET_SUFFIXES = (
+    or
 
-    "q_proj",
-    "k_proj",
-    "v_proj",
-    "o_proj",
+    IMG_CONTEXT_ID
+    ==
+    tokenizer.unk_token_id
+):
 
-    "gate_proj",
-    "up_proj",
-    "down_proj",
+    raise RuntimeError(
+        "IMG_CONTEXT token missing."
+    )
+
+
+print(
+    "IMG_CONTEXT:",
+    IMG_CONTEXT_ID
 )
 
 
-target_modules = []
+# ============================================================
+# 24. Freeze vision components
+# ============================================================
+
+for parameter in (
+    model.vision_model.parameters()
+):
+
+    parameter.requires_grad = (
+        False
+    )
 
 
-for name, module in (
-    model.named_modules()
+for parameter in (
+    model.mlp1.parameters()
+):
+
+    parameter.requires_grad = (
+        False
+    )
+
+
+# Flash contains additional routing/gating components.
+# These are part of the frozen visual pathway.
+
+for name, parameter in (
+    model.named_parameters()
 ):
 
     lower = (
@@ -679,59 +1202,544 @@ for name, module in (
     )
 
 
-    # vision 계층 제외
     if (
-        "vision" in lower
+        "gating"
+        in lower
+
         or
-        "visual" in lower
-        or
-        "intern_vit" in lower
+
+        "router"
+        in lower
     ):
 
-        continue
-
-
-    if any(
-        name.endswith(
-            suffix
+        parameter.requires_grad = (
+            False
         )
 
-        for suffix
-        in TARGET_SUFFIXES
+
+model.vision_model.eval()
+
+model.mlp1.eval()
+
+
+# ============================================================
+# 25. Flash feature extraction helper
+# ============================================================
+
+def normalize_extracted_feature(
+    output,
+):
+
+    # Standard InternVL:
+    # Tensor [tiles, tokens, hidden]
+
+    if torch.is_tensor(
+        output
     ):
 
-        # Linear 계열만
-        if (
-            "linear"
-            in module.__class__
-            .__name__
-            .lower()
-        ):
+        tensor = (
+            output
+        )
 
-            target_modules.append(
-                name
+
+    elif isinstance(
+        output,
+        (tuple, list),
+    ):
+
+        tensor = None
+
+
+        for item in output:
+
+            if (
+                torch.is_tensor(
+                    item
+                )
+
+                and
+
+                item.ndim >= 2
+            ):
+
+                tensor = (
+                    item
+                )
+
+                break
+
+
+        if tensor is None:
+
+            raise RuntimeError(
+                "extract_feature() returned no tensor."
             )
 
 
-target_modules = sorted(
-    set(
-        target_modules
+    elif isinstance(
+        output,
+        dict,
+    ):
+
+        tensor = None
+
+
+        for key in [
+            "vit_embeds",
+            "image_embeds",
+            "features",
+            "last_hidden_state",
+        ]:
+
+            value = output.get(
+                key
+            )
+
+
+            if torch.is_tensor(
+                value
+            ):
+
+                tensor = (
+                    value
+                )
+
+                break
+
+
+        if tensor is None:
+
+            raise RuntimeError(
+                "Cannot locate visual feature tensor."
+            )
+
+
+    else:
+
+        raise RuntimeError(
+            "Unknown extract_feature() output type: "
+            f"{type(output)}"
+        )
+
+
+    # flatten:
+    #
+    # [tiles, tokens, hidden]
+    #      →
+    # [visual_tokens, hidden]
+
+    if tensor.ndim == 3:
+
+        tensor = tensor.reshape(
+            -1,
+            tensor.shape[-1],
+        )
+
+
+    elif tensor.ndim != 2:
+
+        raise RuntimeError(
+            "Unexpected visual feature shape: "
+            f"{tuple(tensor.shape)}"
+        )
+
+
+    return tensor
+
+
+def extract_visual_feature(
+    image,
+    max_tiles=1,
+):
+
+    pixel_values = (
+        preprocess_image(
+
+            image,
+
+            max_tiles,
+        )
     )
+
+
+    pixel_values = (
+        pixel_values
+        .to(
+            DEVICE,
+
+            dtype=(
+                COMPUTE_DTYPE
+            ),
+        )
+    )
+
+
+    model.vision_model.eval()
+
+    model.mlp1.eval()
+
+
+    with (
+        torch.inference_mode(),
+        torch.autocast(
+            device_type="cuda",
+            dtype=COMPUTE_DTYPE,
+        ),
+    ):
+
+        feature_output = (
+            model.extract_feature(
+                pixel_values
+            )
+        )
+
+
+    features = (
+        normalize_extracted_feature(
+            feature_output
+        )
+    )
+
+
+    # Store cache in fp16 to save disk space.
+
+    features = (
+
+        features
+
+        .detach()
+
+        .to(
+            "cpu",
+            dtype=(
+                CACHE_DTYPE
+            ),
+        )
+
+        .contiguous()
+    )
+
+
+    if (
+        features.numel()
+        == 0
+    ):
+
+        raise RuntimeError(
+            "Empty vision feature."
+        )
+
+
+    return features
+
+
+# ============================================================
+# 26. Cache helpers
+# ============================================================
+
+FEATURE_CACHE_DIR.mkdir(
+    parents=True,
+    exist_ok=True,
 )
 
 
-if not target_modules:
+def cache_file(
+    split_name,
+    sample_id,
+):
 
-    raise RuntimeError(
-        "Language LoRA target을 "
-        "찾지 못했습니다."
+    split_dir = (
+        FEATURE_CACHE_DIR
+        / split_name
     )
+
+
+    split_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+
+    safe_id = (
+        str(
+            sample_id
+        )
+        .replace(
+            "/",
+            "_",
+        )
+        .replace(
+            "\\",
+            "_",
+        )
+    )
+
+
+    return (
+        split_dir
+        /
+        f"{safe_id}.pt"
+    )
+
+
+def cache_dataframe(
+    df,
+    split_name,
+):
+
+    print(
+        f"\n===== FEATURE CACHE: "
+        f"{split_name} ====="
+    )
+
+
+    for index in tqdm(
+
+        range(
+            len(
+                df
+            )
+        ),
+
+        desc=(
+            f"Vision cache "
+            f"{split_name}"
+        ),
+    ):
+
+        row = (
+            df.iloc[
+                index
+            ]
+        )
+
+
+        path = cache_file(
+
+            split_name,
+
+            row[
+                "id"
+            ],
+        )
+
+
+        if (
+            path.exists()
+
+            and
+
+            not REBUILD_FEATURE_CACHE
+        ):
+
+            continue
+
+
+        image = load_rgb_image(
+            row[
+                "path"
+            ]
+        )
+
+
+        features = (
+            extract_visual_feature(
+
+                image,
+
+                max_tiles=(
+                    TRAIN_MAX_TILES
+
+                    if split_name
+                    == "train"
+
+                    else
+                    INFER_MAX_TILES
+                ),
+            )
+        )
+
+
+        torch.save(
+            {
+                "features":
+                    features,
+
+                "model_id":
+                    MODEL_ID,
+
+                "image_size":
+                    IMAGE_SIZE,
+
+                "max_tiles":
+                    (
+                        TRAIN_MAX_TILES
+                        if split_name == "train"
+                        else INFER_MAX_TILES
+                    ),
+            },
+
+            path,
+        )
+
+
+def load_cached_feature(
+    split_name,
+    sample_id,
+):
+
+    path = cache_file(
+
+        split_name,
+
+        sample_id,
+    )
+
+
+    if not path.exists():
+
+        raise FileNotFoundError(
+            f"Feature cache missing: "
+            f"{path}"
+        )
+
+
+    data = torch.load(
+
+        path,
+
+        map_location="cpu",
+
+        weights_only=False,
+    )
+
+
+    if (
+        data.get(
+            "model_id"
+        )
+        !=
+        MODEL_ID
+    ):
+
+        raise RuntimeError(
+            "Feature cache model mismatch."
+        )
+
+
+    return (
+        data[
+            "features"
+        ]
+    )
+
+
+# ============================================================
+# 27. Build all fixed visual caches
+#
+# IMPORTANT:
+#
+# This is the only time the vision encoder sees
+# train/valid/test original images.
+#
+# ============================================================
+
+cache_dataframe(
+    train_subset,
+    "train",
+)
+
+
+cache_dataframe(
+    valid_subset,
+    "valid",
+)
+
+
+cache_dataframe(
+    test_df,
+    "test",
+)
+
+
+# ============================================================
+# 28. Feature sanity
+# ============================================================
+
+sample_feature = (
+    load_cached_feature(
+
+        "train",
+
+        train_subset.iloc[0][
+            "id"
+        ],
+    )
+)
 
 
 print(
-    "\nLoRA targets:",
-    len(target_modules)
+    "\n===== FEATURE CHECK ====="
 )
+
+print(
+    "Feature shape:",
+    tuple(
+        sample_feature.shape
+    )
+)
+
+print(
+    "dtype:",
+    sample_feature.dtype
+)
+
+
+# ============================================================
+# 29. Freeze everything except language LoRA
+# ============================================================
+
+for parameter in (
+    model.parameters()
+):
+
+    parameter.requires_grad = (
+        False
+    )
+
+
+# ============================================================
+# 30. Prepare inner LLM for QLoRA
+# ============================================================
+
+model.language_model = (
+    prepare_model_for_kbit_training(
+
+        model.language_model,
+
+        use_gradient_checkpointing=True,
+    )
+)
+
+
+model.language_model.config.use_cache = (
+    False
+)
+
+
+# ============================================================
+# 31. Language LoRA
+# ============================================================
+
+LLM_TARGET_MODULES = [
+    "self_attn.q_proj",
+    "self_attn.k_proj",
+    "self_attn.v_proj",
+    "self_attn.o_proj",
+    "mlp.gate_proj",
+    "mlp.down_proj",
+    "mlp.up_proj",
+]
 
 
 lora_config = (
@@ -750,7 +1758,7 @@ lora_config = (
         bias="none",
 
         target_modules=(
-            target_modules
+            LLM_TARGET_MODULES
         ),
 
         task_type="CAUSAL_LM",
@@ -758,30 +1766,80 @@ lora_config = (
 )
 
 
-model = get_peft_model(
-    model,
-    lora_config,
+model.language_model = (
+    get_peft_model(
+
+        model.language_model,
+
+        lora_config,
+    )
 )
 
 
-model.print_trainable_parameters()
+if hasattr(
+    model.language_model,
+    "enable_input_require_grads",
+):
+
+    model.language_model.enable_input_require_grads()
+
+
+model.language_model.print_trainable_parameters()
 
 
 # ============================================================
-# 15. Prompts
+# 32. Verify visual feature hidden size
 # ============================================================
 
-SYSTEM_INSTRUCT = (
+embedding_layer = (
+    model.language_model
+    .get_input_embeddings()
+)
+
+
+embedding_dim = (
+    embedding_layer
+    .weight
+    .shape[-1]
+)
+
+
+if (
+    sample_feature.shape[-1]
+    !=
+    embedding_dim
+):
+
+    raise RuntimeError(
+
+        "Vision/LLM hidden size mismatch: "
+        f"vision={sample_feature.shape[-1]}, "
+        f"llm={embedding_dim}"
+    )
+
+
+print(
+    "LLM hidden:",
+    embedding_dim
+)
+
+
+# ============================================================
+# 33. Prompt
+# ============================================================
+
+SYSTEM_INSTRUCTION = (
     "You are a visual multiple-choice "
     "question answering assistant. "
-    "Inspect the image carefully and answer "
-    "using exactly one lowercase letter: "
+    "Inspect the image carefully and choose "
+    "the best answer. "
+    "Output exactly one lowercase letter: "
     "a, b, c, or d. "
     "Do not explain."
 )
 
 
-def build_question_text(
+def build_mc_text(
     row,
 ):
 
@@ -791,97 +1849,205 @@ def build_question_text(
         f"(b) {row['b']}\n"
         f"(c) {row['c']}\n"
         f"(d) {row['d']}\n\n"
-        "Return exactly one lowercase letter: "
+        "Answer with exactly one lowercase letter: "
         "a, b, c, or d."
     )
 
 
-def build_messages(
-    row,
-    images,
-    extra_context=None,
+# ============================================================
+# 34. InternVL native conversation
+# ============================================================
+
+def visual_placeholder(
+    feature_count,
 ):
 
-    content = []
+    return (
 
+        IMG_START_TOKEN
 
-    # 원본 + crop 모두 이미지로 전달
-    for image in images:
+        +
 
-        content.append(
-            {
-                "type": "image",
-                "image": image,
-            }
+        IMG_CONTEXT_TOKEN
+        *
+        int(
+            feature_count
         )
 
+        +
 
-    text = build_question_text(
-        row
+        IMG_END_TOKEN
     )
 
 
-    if extra_context:
+def replace_image_placeholders(
+    query,
+    feature_counts,
+):
 
-        text = (
-            "External visual tools produced "
-            "the following observations.\n\n"
+    for count in (
+        feature_counts
+    ):
 
-            + extra_context
+        if "<image>" not in query:
 
-            + "\n\n"
-            "The tool outputs may contain errors. "
-            "Use them only as supporting evidence. "
-            "Inspect the image yourself and make "
-            "the final decision.\n\n"
+            raise RuntimeError(
+                "Image placeholder mismatch."
+            )
 
-            + text
+
+        query = query.replace(
+
+            "<image>",
+
+            visual_placeholder(
+                count
+            ),
+
+            1,
         )
 
 
-    content.append(
-        {
-            "type": "text",
-            "text": text,
-        }
+    if "<image>" in query:
+
+        raise RuntimeError(
+            "Unused <image> placeholder."
+        )
+
+
+    return query
+
+
+def make_query(
+    user_text,
+    feature_counts,
+    answer=None,
+):
+
+    template = copy.deepcopy(
+        model.conv_template
     )
 
 
-    return [
-        {
-            "role": "system",
-            "content": [
-                {
-                    "type": "text",
-                    "text": SYSTEM_INSTRUCT,
-                }
-            ],
-        },
+    template.system_message = (
+        SYSTEM_INSTRUCTION
+    )
 
-        {
-            "role": "user",
-            "content": content,
-        },
+
+    template.append_message(
+
+        template.roles[0],
+
+        user_text,
+    )
+
+
+    template.append_message(
+
+        template.roles[1],
+
+        answer,
+    )
+
+
+    query = (
+        template.get_prompt()
+    )
+
+
+    return replace_image_placeholders(
+
+        query,
+
+        feature_counts,
+    )
+
+
+def build_first_user_text(
+    row,
+):
+
+    return (
+        "<image>\n"
+        +
+        build_mc_text(
+            row
+        )
+    )
+
+
+def build_tool_user_text(
+    row,
+    num_images,
+    context,
+):
+
+    lines = [
+        "Original image: <image>"
     ]
 
 
+    for index in range(
+        1,
+        num_images,
+    ):
+
+        lines.append(
+            f"Detected crop {index}: <image>"
+        )
+
+
+    return (
+
+        "\n".join(
+            lines
+        )
+
+        +
+
+        "\n\nExternal visual-tool observations:\n"
+
+        +
+
+        context
+
+        +
+
+        "\n\nThese observations may contain errors. "
+        "Treat them only as supporting evidence. "
+        "Use the original image as the primary evidence.\n\n"
+
+        +
+
+        build_mc_text(
+            row
+        )
+    )
+
+
 # ============================================================
-# 16. Training Dataset
+# 35. Training Dataset
 # ============================================================
 
-class InternDataset(
+class CachedInternDataset(
     Dataset
 ):
 
     def __init__(
         self,
         df,
+        split_name,
     ):
 
         self.df = (
             df.reset_index(
                 drop=True
             )
+        )
+
+
+        self.split_name = (
+            split_name
         )
 
 
@@ -896,68 +2062,101 @@ class InternDataset(
 
     def __getitem__(
         self,
-        idx,
+        index,
     ):
 
         row = (
             self.df.iloc[
-                idx
+                index
             ]
         )
 
 
-        image = load_rgb_image(
-            row["path"]
+        visual_feature = (
+            load_cached_feature(
+
+                self.split_name,
+
+                row[
+                    "id"
+                ],
+            )
+        )
+
+
+        feature_count = int(
+            visual_feature.shape[0]
         )
 
 
         gold = (
             str(
-                row["answer"]
+                row[
+                    "answer"
+                ]
             )
+
             .strip()
+
             .lower()
         )
 
 
-        messages = build_messages(
-            row,
-            [image],
+        user_text = (
+            build_first_user_text(
+                row
+            )
         )
 
 
-        full_messages = (
-            messages
-            + [
-                {
-                    "role": "assistant",
+        prompt_query = (
+            make_query(
 
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": gold,
-                        }
-                    ],
-                }
-            ]
+                user_text,
+
+                [
+                    feature_count
+                ],
+
+                answer=None,
+            )
+        )
+
+
+        full_query = (
+            make_query(
+
+                user_text,
+
+                [
+                    feature_count
+                ],
+
+                answer=gold,
+            )
         )
 
 
         return {
-            "image": image,
-            "messages": messages,
-            "full_messages": full_messages,
+            "features":
+                visual_feature,
+
+            "prompt":
+                prompt_query,
+
+            "full":
+                full_query,
         }
 
 
 # ============================================================
-# 17. Collator
+# 36. Training Collator
 # ============================================================
 
 @dataclass
-class TrainCollator:
+class CachedCollator:
 
-    processor: Any
+    tokenizer: Any
 
 
     def __call__(
@@ -965,81 +2164,64 @@ class TrainCollator:
         batch,
     ):
 
-        images = [
-            sample["image"]
+        features = [
+
+            sample[
+                "features"
+            ]
+
             for sample
             in batch
         ]
 
 
-        prompt_texts = []
+        prompts = [
 
-        full_texts = []
+            sample[
+                "prompt"
+            ]
+
+            for sample
+            in batch
+        ]
 
 
-        for sample in batch:
+        fulls = [
 
-            prompt_texts.append(
-                self.processor
-                .apply_chat_template(
+            sample[
+                "full"
+            ]
 
-                    sample[
-                        "messages"
-                    ],
+            for sample
+            in batch
+        ]
 
-                    tokenize=False,
 
-                    add_generation_prompt=True,
-                )
+        prompt_enc = (
+            self.tokenizer(
+
+                prompts,
+
+                padding=True,
+
+                return_tensors="pt",
+
+                add_special_tokens=True,
             )
+        )
 
 
-            full_texts.append(
-                self.processor
-                .apply_chat_template(
+        full_enc = (
+            self.tokenizer(
 
-                    sample[
-                        "full_messages"
-                    ],
+                fulls,
 
-                    tokenize=False,
+                padding=True,
 
-                    add_generation_prompt=False,
-                )
+                return_tensors="pt",
+
+                add_special_tokens=True,
             )
-
-
-        full_enc = self.processor(
-
-            text=full_texts,
-
-            images=images,
-
-            padding=True,
-
-            return_tensors="pt",
-        )
-
-
-        prompt_enc = self.processor(
-
-            text=prompt_texts,
-
-            images=images,
-
-            padding=True,
-
-            return_tensors="pt",
-        )
-
-
-        full_enc = sanitize_inputs(
-            full_enc
-        )
-
-
-        prompt_enc = sanitize_inputs(
-            prompt_enc
         )
 
 
@@ -1057,35 +2239,31 @@ class TrainCollator:
             len(batch)
         ):
 
-            full_pos = (
-                full_enc[
-                    "attention_mask"
-                ][i]
-                .nonzero(
-                    as_tuple=False
-                )
-                .squeeze(-1)
-            )
-
-
             prompt_pos = (
+
                 prompt_enc[
                     "attention_mask"
                 ][i]
+
                 .nonzero(
                     as_tuple=False
                 )
+
                 .squeeze(-1)
             )
 
 
-            full_ids = (
+            full_pos = (
+
                 full_enc[
-                    "input_ids"
-                ][
-                    i,
-                    full_pos
-                ]
+                    "attention_mask"
+                ][i]
+
+                .nonzero(
+                    as_tuple=False
+                )
+
+                .squeeze(-1)
             )
 
 
@@ -1099,6 +2277,16 @@ class TrainCollator:
             )
 
 
+            full_ids = (
+                full_enc[
+                    "input_ids"
+                ][
+                    i,
+                    full_pos
+                ]
+            )
+
+
             prompt_len = int(
                 prompt_ids.numel()
             )
@@ -1108,9 +2296,9 @@ class TrainCollator:
 
                 full_ids[
                     :prompt_len
-                ].cpu(),
+                ],
 
-                prompt_ids.cpu(),
+                prompt_ids,
             ):
 
                 raise RuntimeError(
@@ -1129,6 +2317,7 @@ class TrainCollator:
                 i,
                 answer_pos
             ] = (
+
                 full_enc[
                     "input_ids"
                 ][
@@ -1138,22 +2327,78 @@ class TrainCollator:
             )
 
 
-        full_enc[
-            "labels"
-        ] = labels
+        # ----------------------------------------------------
+        # Visual-token sanity
+        # ----------------------------------------------------
+
+        expected = sum(
+
+            int(
+                feature.shape[0]
+            )
+
+            for feature
+            in features
+        )
 
 
-        return full_enc
+        actual = int(
+
+            (
+                full_enc[
+                    "input_ids"
+                ]
+                ==
+                IMG_CONTEXT_ID
+            )
+
+            .sum()
+
+            .item()
+        )
+
+
+        if (
+            expected
+            != actual
+        ):
+
+            raise RuntimeError(
+
+                "Visual token mismatch: "
+                f"features={expected}, "
+                f"context_tokens={actual}"
+            )
+
+
+        return {
+            "features":
+                features,
+
+            "input_ids":
+                full_enc[
+                    "input_ids"
+                ],
+
+            "attention_mask":
+                full_enc[
+                    "attention_mask"
+                ],
+
+            "labels":
+                labels,
+        }
 
 
 # ============================================================
-# 18. Train Loader
+# 37. Loader
 # ============================================================
 
 train_loader = DataLoader(
 
-    InternDataset(
-        train_subset
+    CachedInternDataset(
+        train_subset,
+        "train",
     ),
 
     batch_size=(
@@ -1163,114 +2408,166 @@ train_loader = DataLoader(
     shuffle=True,
 
     collate_fn=(
-        TrainCollator(
-            processor
+        CachedCollator(
+            tokenizer
         )
     ),
 
     num_workers=0,
+
+    pin_memory=False,
+)
+
+
+print(
+    "\nTrain batches:",
+    len(train_loader)
 )
 
 
 # ============================================================
-# 19. Discover a/b/c/d tokens
+# 38. Inject cached visual features
 # ============================================================
 
-def discover_choice_tokens():
+def inject_visual_features(
+    input_ids,
+    visual_features,
+):
 
-    dummy = Image.new(
-        "RGB",
-        (448, 448),
-    )
+    input_embeds = (
 
-
-    row = {
-        "question":
-            "Choose the correct answer.",
-
-        "a": "one",
-        "b": "two",
-        "c": "three",
-        "d": "four",
-    }
-
-
-    messages = build_messages(
-        row,
-        [dummy],
-    )
-
-
-    prompt = (
-        processor
-        .apply_chat_template(
-
-            messages,
-
-            tokenize=False,
-
-            add_generation_prompt=True,
+        model.language_model
+        .get_input_embeddings()
+        (
+            input_ids
         )
     )
 
 
-    prompt_ids = (
-        processor.tokenizer(
-
-            prompt,
-
-            add_special_tokens=False,
-        )[
-            "input_ids"
-        ]
+    input_embeds = (
+        input_embeds.clone()
     )
+
+
+    visual_mask = (
+        input_ids
+        ==
+        IMG_CONTEXT_ID
+    )
+
+
+    flat_features = torch.cat(
+
+        [
+            feature.to(
+                DEVICE,
+
+                dtype=(
+                    input_embeds.dtype
+                ),
+            )
+
+            for feature
+            in visual_features
+        ],
+
+        dim=0,
+    )
+
+
+    selected_count = int(
+
+        visual_mask.sum().item()
+    )
+
+
+    if (
+        selected_count
+        !=
+        flat_features.shape[0]
+    ):
+
+        raise RuntimeError(
+
+            "Feature injection mismatch: "
+            f"tokens={selected_count}, "
+            f"features={flat_features.shape[0]}"
+        )
+
+
+    input_embeds[
+        visual_mask
+    ] = (
+        flat_features
+    )
+
+
+    return input_embeds
+
+
+# ============================================================
+# 39. Choice token discovery
+# ============================================================
+
+def discover_choice_tokens():
+
+    user_text = (
+        "<image>\n"
+        "Choose the correct answer.\n\n"
+        "(a) one\n"
+        "(b) two\n"
+        "(c) three\n"
+        "(d) four\n\n"
+        "Answer with exactly one lowercase letter: "
+        "a, b, c, or d."
+    )
+
+
+    prompt = make_query(
+
+        user_text,
+
+        [1],
+
+        answer=None,
+    )
+
+
+    prompt_ids = tokenizer(
+
+        prompt,
+
+        add_special_tokens=True,
+    )[
+        "input_ids"
+    ]
 
 
     result = {}
 
 
-    for choice in CHOICES:
+    for choice in (
+        CHOICES
+    ):
 
-        full = (
-            messages
-            + [
-                {
-                    "role": "assistant",
+        full = make_query(
 
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": choice,
-                        }
-                    ],
-                }
-            ]
+            user_text,
+
+            [1],
+
+            answer=choice,
         )
 
 
-        full_text = (
-            processor
-            .apply_chat_template(
+        full_ids = tokenizer(
 
-                full,
+            full,
 
-                tokenize=False,
-
-                add_generation_prompt=False,
-            )
-        )
-
-
-        full_ids = (
-            processor.tokenizer(
-
-                full_text,
-
-                add_special_tokens=False,
-            )[
-                "input_ids"
-            ]
-        )
+            add_special_tokens=True,
+        )[
+            "input_ids"
+        ]
 
 
         if (
@@ -1281,7 +2578,7 @@ def discover_choice_tokens():
         ):
 
             raise RuntimeError(
-                "Choice token prefix mismatch."
+                "Choice prefix mismatch."
             )
 
 
@@ -1292,9 +2589,25 @@ def discover_choice_tokens():
         )
 
 
+        if not suffix:
+
+            raise RuntimeError(
+                f"No token for {choice}"
+            )
+
+
         result[
             choice
-        ] = suffix[0]
+        ] = (
+            suffix[0]
+        )
+
+
+        print(
+            f"{choice}: "
+            f"{suffix[0]} "
+            f"{tokenizer.decode([suffix[0]])!r}"
+        )
 
 
     if (
@@ -1307,14 +2620,14 @@ def discover_choice_tokens():
     ):
 
         raise RuntimeError(
-            "Choice token IDs not unique."
+            "Choice tokens not unique."
         )
 
 
     return result
 
 
-choice_token_ids = (
+CHOICE_TOKEN_IDS = (
     discover_choice_tokens()
 )
 
@@ -1323,8 +2636,12 @@ CHOICE_TOKEN_TENSOR = (
     torch.tensor(
 
         [
-            choice_token_ids[c]
-            for c in CHOICES
+            CHOICE_TOKEN_IDS[
+                c
+            ]
+
+            for c
+            in CHOICES
         ],
 
         dtype=torch.long,
@@ -1334,24 +2651,72 @@ CHOICE_TOKEN_TENSOR = (
 )
 
 
+# ============================================================
+# 40. Training preflight
+# ============================================================
+
+debug_batch = next(
+    iter(
+        train_loader
+    )
+)
+
+
+debug_target = (
+
+    debug_batch[
+        "labels"
+    ][0]
+
+    [
+        debug_batch[
+            "labels"
+        ][0]
+        != -100
+    ]
+)
+
+
 print(
-    "Choice tokens:",
-    choice_token_ids
+    "\n===== TRAIN PREFLIGHT ====="
+)
+
+print(
+    "Target:",
+    repr(
+        tokenizer.decode(
+            debug_target
+        )
+    )
+)
+
+print(
+    "Cached feature counts:",
+    [
+        tuple(
+            feature.shape
+        )
+
+        for feature
+        in debug_batch[
+            "features"
+        ]
+    ]
 )
 
 
 # ============================================================
-# 20. Optimizer
+# 41. Optimizer
 # ============================================================
 
 trainable_parameters = [
 
-    p
+    parameter
 
-    for p
+    for parameter
     in model.parameters()
 
-    if p.requires_grad
+    if parameter.requires_grad
 ]
 
 
@@ -1381,13 +2746,15 @@ steps_per_epoch = (
 
 total_steps = (
     NUM_EPOCHS
-    * steps_per_epoch
+    *
+    steps_per_epoch
 )
 
 
 warmup_steps = int(
     total_steps
-    * WARMUP_RATIO
+    *
+    WARMUP_RATIO
 )
 
 
@@ -1396,25 +2763,36 @@ scheduler = (
 
         optimizer,
 
-        warmup_steps,
+        num_warmup_steps=(
+            warmup_steps
+        ),
 
-        total_steps,
+        num_training_steps=(
+            total_steps
+        ),
     )
 )
 
 
-scaler = (
-    torch.amp.GradScaler(
+scaler = torch.amp.GradScaler(
 
-        "cuda",
+    "cuda",
 
-        enabled=USE_SCALER,
-    )
+    enabled=(
+        USE_SCALER
+    ),
 )
 
 
 # ============================================================
-# 21. Train InternVL
+# 42. Training
+#
+# IMPORTANT:
+#
+# model.extract_feature()
+# model.vision_model()
+#
+# ARE NEVER CALLED HERE.
 # ============================================================
 
 optimizer.zero_grad(
@@ -1426,55 +2804,152 @@ for epoch in range(
     NUM_EPOCHS
 ):
 
-    model.train()
+    model.language_model.train()
+
+    running_loss = 0.0
+
+    batch_count = 0
+
+    num_batches = len(
+        train_loader
+    )
 
 
-    total_loss = 0.0
+    progress = tqdm(
 
-    count = 0
-
-
-    bar = tqdm(
         train_loader,
-        desc="InternVL training",
+
+        desc=(
+            f"Flash cached "
+            f"{epoch + 1}/"
+            f"{NUM_EPOCHS}"
+        ),
+
+        unit="batch",
     )
 
 
     for step, batch in enumerate(
-        bar,
+        progress,
         1,
     ):
 
-        batch = sanitize_inputs(
-            batch
+        input_ids = (
+            batch[
+                "input_ids"
+            ]
+            .to(
+                DEVICE
+            )
         )
 
 
-        batch = {
-            k: v.to(DEVICE)
+        attention_mask = (
+            batch[
+                "attention_mask"
+            ]
+            .to(
+                DEVICE
+            )
+        )
 
-            for k, v
-            in batch.items()
-        }
+
+        labels = (
+            batch[
+                "labels"
+            ]
+            .to(
+                DEVICE
+            )
+        )
 
 
-        with autocast_context():
+        input_embeds = (
+            inject_visual_features(
 
-            out = model(
-                **batch,
-                use_cache=False,
+                input_ids,
+
+                batch[
+                    "features"
+                ],
+            )
+        )
+
+
+        group_start = (
+
+            (
+                (step - 1)
+                //
+                GRAD_ACCUM
+            )
+
+            *
+            GRAD_ACCUM
+
+            + 1
+        )
+
+
+        accum_divisor = min(
+
+            GRAD_ACCUM,
+
+            num_batches
+            -
+            group_start
+            + 1,
+        )
+
+
+        with torch.autocast(
+
+            device_type="cuda",
+
+            dtype=(
+                COMPUTE_DTYPE
+            ),
+        ):
+
+            outputs = (
+                model.language_model(
+
+                    inputs_embeds=(
+                        input_embeds
+                    ),
+
+                    attention_mask=(
+                        attention_mask
+                    ),
+
+                    labels=(
+                        labels
+                    ),
+
+                    use_cache=False,
+                )
             )
 
 
             raw_loss = (
-                out.loss
+                outputs.loss
             )
 
 
             loss = (
                 raw_loss
                 /
-                GRAD_ACCUM
+                accum_divisor
+            )
+
+
+        if not torch.isfinite(
+            raw_loss
+        ).item():
+
+            raise RuntimeError(
+                f"Non-finite loss "
+                f"{raw_loss.item()}"
             )
 
 
@@ -1489,22 +2964,33 @@ for epoch in range(
             loss.backward()
 
 
-        total_loss += float(
+        running_loss += (
             raw_loss
             .detach()
             .float()
+            .item()
         )
 
 
-        count += 1
+        batch_count += 1
 
 
-        if (
-            step % GRAD_ACCUM == 0
-            or step == len(
-                train_loader
-            )
-        ):
+        should_step = (
+
+            step
+            %
+            GRAD_ACCUM
+            == 0
+
+            or
+
+            step
+            ==
+            num_batches
+        )
+
+
+        if should_step:
 
             if USE_SCALER:
 
@@ -1514,7 +3000,9 @@ for epoch in range(
 
 
             torch.nn.utils.clip_grad_norm_(
+
                 trainable_parameters,
+
                 MAX_GRAD_NORM,
             )
 
@@ -1540,15 +3028,27 @@ for epoch in range(
             )
 
 
-        bar.set_postfix(
+        avg_loss = (
+            running_loss
+            /
+            batch_count
+        )
+
+
+        progress.set_postfix(
+
             loss=(
-                f"{total_loss / count:.4f}"
-            )
+                f"{avg_loss:.4f}"
+            ),
+
+            lr=(
+                f"{scheduler.get_last_lr()[0]:.2e}"
+            ),
         )
 
 
 # ============================================================
-# 22. Save InternVL adapter
+# 43. Save LoRA
 # ============================================================
 
 SAVE_DIR.mkdir(
@@ -1557,90 +3057,142 @@ SAVE_DIR.mkdir(
 )
 
 
-model.save_pretrained(
+model.language_model.save_pretrained(
+
     SAVE_DIR
+    / "language_lora"
 )
 
 
-processor.save_pretrained(
+tokenizer.save_pretrained(
     SAVE_DIR
 )
 
 
 # ============================================================
-# 23. First-pass InternVL
+# 44. Cached prediction
 # ============================================================
 
-def internvl_predict(
+def predict_from_features(
     row,
-    images,
-    extra_context=None,
+    visual_features,
+    tool_context=None,
 ):
 
-    model.eval()
+    model.language_model.eval()
 
 
-    messages = build_messages(
+    feature_counts = [
 
-        row,
+        int(
+            feature.shape[0]
+        )
 
-        images,
+        for feature
+        in visual_features
+    ]
 
-        extra_context=(
-            extra_context
-        ),
+
+    if tool_context is None:
+
+        user_text = (
+            build_first_user_text(
+                row
+            )
+        )
+
+    else:
+
+        user_text = (
+            build_tool_user_text(
+
+                row,
+
+                len(
+                    visual_features
+                ),
+
+                tool_context,
+            )
+        )
+
+
+    query = make_query(
+
+        user_text,
+
+        feature_counts,
+
+        answer=None,
     )
 
 
-    text = (
-        processor
-        .apply_chat_template(
+    encoded = tokenizer(
 
-            messages,
+        query,
 
-            tokenize=False,
+        return_tensors="pt",
 
-            add_generation_prompt=True,
+        add_special_tokens=True,
+    )
+
+
+    input_ids = (
+        encoded[
+            "input_ids"
+        ]
+        .to(
+            DEVICE
         )
     )
 
 
-    inputs = processor(
-
-        text=[text],
-
-        images=images,
-
-        return_tensors="pt",
+    attention_mask = (
+        encoded[
+            "attention_mask"
+        ]
+        .to(
+            DEVICE
+        )
     )
 
 
-    inputs = sanitize_inputs(
-        inputs
+    input_embeds = (
+        inject_visual_features(
+
+            input_ids,
+
+            visual_features,
+        )
     )
-
-
-    inputs = {
-        k: v.to(DEVICE)
-
-        for k, v
-        in inputs.items()
-    }
 
 
     with (
         torch.inference_mode(),
-        autocast_context(),
+        torch.autocast(
+            device_type="cuda",
+            dtype=COMPUTE_DTYPE,
+        ),
     ):
 
-        out = model(
-            **inputs,
-            use_cache=False,
+        outputs = (
+            model.language_model(
+
+                inputs_embeds=(
+                    input_embeds
+                ),
+
+                attention_mask=(
+                    attention_mask
+                ),
+
+                use_cache=False,
+            )
         )
 
 
-        logits = (
-            out.logits[
+        next_logits = (
+            outputs.logits[
                 0,
                 -1,
             ]
@@ -1649,9 +3201,11 @@ def internvl_predict(
 
 
         choice_logits = (
-            logits
+            next_logits
             .index_select(
+
                 0,
+
                 CHOICE_TOKEN_TENSOR,
             )
         )
@@ -1665,12 +3219,18 @@ def internvl_predict(
 
     pred_index = int(
         top2.indices[0]
+        .item()
     )
 
 
     margin = float(
-        top2.values[0]
-        - top2.values[1]
+
+        (
+            top2.values[0]
+            -
+            top2.values[1]
+        )
+        .item()
     )
 
 
@@ -1690,49 +3250,33 @@ def internvl_predict(
 
 
 # ============================================================
-# 24. Rule Router
+# 45. Router
 # ============================================================
 
 OBJECT_KEYWORDS = [
-
     "몇 개",
     "몇개",
     "개수",
     "수량",
-
     "왼쪽",
     "오른쪽",
+    "좌측",
+    "우측",
     "중앙",
     "가운데",
-
-    "위",
-    "아래",
-
-    "어디",
     "위치",
-
-    "보이는",
-    "들어 있는",
-
-    "병",
-    "캔",
-    "컵",
-    "용기",
+    "어디",
 ]
 
 
 MATERIAL_KEYWORDS = [
-
     "재질",
     "소재",
-
     "플라스틱",
-    "비닐",
     "유리",
     "금속",
     "종이",
-    "캔",
-
+    "비닐",
     "plastic",
     "glass",
     "metal",
@@ -1744,7 +3288,13 @@ def route_tools(
     question,
     margin,
     threshold,
+    enabled=True,
 ):
+
+    if not enabled:
+
+        return []
+
 
     q = str(
         question
@@ -1752,6 +3302,7 @@ def route_tools(
 
 
     object_match = any(
+
         keyword in q
 
         for keyword
@@ -1760,6 +3311,7 @@ def route_tools(
 
 
     material_match = any(
+
         keyword in q
 
         for keyword
@@ -1778,7 +3330,9 @@ def route_tools(
 
     if (
         USE_GENERAL_YOLO
+
         and
+
         (
             object_match
             or
@@ -1787,13 +3341,15 @@ def route_tools(
     ):
 
         tools.append(
-            "general_yolo"
+            "general"
         )
 
 
     if (
         USE_MATERIAL_YOLO
+
         and
+
         (
             material_match
             or
@@ -1802,13 +3358,16 @@ def route_tools(
     ):
 
         tools.append(
-            "material_yolo"
+            "material"
         )
 
 
     if (
         USE_CROP_TOOL
-        and tools
+
+        and
+
+        tools
     ):
 
         tools.append(
@@ -1820,8 +3379,13 @@ def route_tools(
 
 
 # ============================================================
-# 25. Load YOLO tools
+# 46. Load YOLO models
 # ============================================================
+
+print(
+    "\n===== LOAD YOLO TOOLS ====="
+)
+
 
 general_yolo = None
 
@@ -1830,111 +3394,45 @@ material_yolo = None
 
 if USE_GENERAL_YOLO:
 
-    print(
-        "\nLoading General YOLO..."
-    )
-
     general_yolo = YOLO(
         GENERAL_YOLO_MODEL
     )
 
 
-# ============================================================
-# Material checkpoint automatic discovery
-# ============================================================
-
-def find_hf_yolo_checkpoint(
-    repo_id,
-):
-
-    files = list_repo_files(
-        repo_id
-    )
-
-
-    pt_files = [
-        name
-        for name in files
-        if name.lower().endswith(
-            ".pt"
-        )
-    ]
-
-
-    if not pt_files:
-
-        raise RuntimeError(
-            f"No .pt YOLO checkpoint "
-            f"found in {repo_id}"
-        )
-
-
-    # best.pt 우선
-    preferred = [
-
-        name
-
-        for name
-        in pt_files
-
-        if Path(
-            name
-        ).name.lower()
-        == "best.pt"
-    ]
-
-
-    filename = (
-        preferred[0]
-        if preferred
-        else pt_files[0]
-    )
-
-
-    print(
-        "Material YOLO checkpoint:",
-        filename
-    )
-
-
-    return hf_hub_download(
-
-        repo_id=repo_id,
-
-        filename=filename,
-    )
-
-
 if USE_MATERIAL_YOLO:
 
-    print(
-        "\nLoading Material YOLO..."
-    )
+    material_path = (
+        hf_hub_download(
 
+            repo_id=(
+                MATERIAL_REPO
+            ),
 
-    material_checkpoint = (
-        find_hf_yolo_checkpoint(
-            MATERIAL_YOLO_REPO
+            filename=(
+                MATERIAL_FILENAME
+            ),
         )
     )
 
 
     material_yolo = YOLO(
-        material_checkpoint
+        material_path
     )
 
 
 # ============================================================
-# 26. YOLO result helpers
+# 47. Detection helpers
 # ============================================================
 
-def box_position(
+def get_position(
     bbox,
     width,
     height,
 ):
 
-    x1, y1, x2, y2 = bbox
+    x1, y1, x2, y2 = (
+        bbox
+    )
 
 
     cx = (
@@ -1948,27 +3446,37 @@ def box_position(
 
 
     horizontal = (
+
         "left"
+
         if cx < width / 3
 
         else
+
         "right"
+
         if cx > width * 2 / 3
 
         else
+
         "center"
     )
 
 
     vertical = (
+
         "top"
+
         if cy < height / 3
 
         else
+
         "bottom"
+
         if cy > height * 2 / 3
 
         else
+
         "middle"
     )
 
@@ -1978,7 +3486,7 @@ def box_position(
     )
 
 
-def parse_yolo_results(
+def parse_yolo(
     result,
     image,
 ):
@@ -1990,6 +3498,11 @@ def parse_yolo_results(
         result is None
         or
         result.boxes is None
+        or
+        len(
+            result.boxes
+        )
+        == 0
     ):
 
         return output
@@ -2029,7 +3542,11 @@ def parse_yolo_results(
     )
 
 
-    for bbox, conf, cls in zip(
+    for (
+        bbox,
+        confidence,
+        cls,
+    ) in zip(
         boxes,
         confs,
         classes,
@@ -2040,40 +3557,34 @@ def parse_yolo_results(
         )
 
 
-        label = (
-            names[
-                class_id
-            ]
-
-            if isinstance(
-                names,
-                dict
-            )
-
-            else names[
-                class_id
-            ]
-        )
-
-
         output.append(
             {
                 "label":
-                    str(label),
+                    str(
+                        names[
+                            class_id
+                        ]
+                    ),
 
                 "confidence":
-                    float(conf),
+                    float(
+                        confidence
+                    ),
 
                 "bbox":
                     [
                         float(x)
-                        for x in bbox
+                        for x
+                        in bbox
                     ],
 
                 "position":
-                    box_position(
+                    get_position(
+
                         bbox,
+
                         width,
+
                         height,
                     ),
             }
@@ -2081,8 +3592,11 @@ def parse_yolo_results(
 
 
     output.sort(
-        key=lambda x:
-            x["confidence"],
+
+        key=lambda item:
+            item[
+                "confidence"
+            ],
 
         reverse=True,
     )
@@ -2090,10 +3604,6 @@ def parse_yolo_results(
 
     return output
 
-
-# ============================================================
-# 27. General YOLO Tool
-# ============================================================
 
 def run_general_yolo(
     image,
@@ -2124,15 +3634,11 @@ def run_general_yolo(
     )
 
 
-    return parse_yolo_results(
+    return parse_yolo(
         result,
         image,
     )
 
-
-# ============================================================
-# 28. Material YOLO Tool
-# ============================================================
 
 def run_material_yolo(
     image,
@@ -2163,14 +3669,14 @@ def run_material_yolo(
     )
 
 
-    return parse_yolo_results(
+    return parse_yolo(
         result,
         image,
     )
 
 
 # ============================================================
-# 29. Crop / Zoom Tool
+# 48. Crop
 # ============================================================
 
 def crop_bbox(
@@ -2183,28 +3689,32 @@ def crop_bbox(
     )
 
 
-    x1, y1, x2, y2 = bbox
+    x1, y1, x2, y2 = (
+        bbox
+    )
 
 
-    box_w = (
+    w = (
         x2 - x1
     )
 
 
-    box_h = (
+    h = (
         y2 - y1
     )
 
 
     pad_x = (
-        box_w
-        * CROP_PADDING_RATIO
+        w
+        *
+        CROP_PADDING_RATIO
     )
 
 
     pad_y = (
-        box_h
-        * CROP_PADDING_RATIO
+        h
+        *
+        CROP_PADDING_RATIO
     )
 
 
@@ -2259,40 +3769,35 @@ def crop_bbox(
     )
 
 
-    # 작은 crop 확대
-    min_side = min(
+    if min(
         crop.size
-    )
-
-
-    if min_side < 448:
+    ) < IMAGE_SIZE:
 
         scale = (
-            448
+            IMAGE_SIZE
             /
             max(
-                min_side,
-                1
+                min(
+                    crop.size
+                ),
+                1,
             )
         )
 
 
-        new_size = (
-
-            int(
-                crop.width
-                * scale
-            ),
-
-            int(
-                crop.height
-                * scale
-            ),
-        )
-
-
         crop = crop.resize(
-            new_size,
+
+            (
+                int(
+                    crop.width
+                    * scale
+                ),
+
+                int(
+                    crop.height
+                    * scale
+                ),
+            ),
 
             Image.Resampling.BICUBIC,
         )
@@ -2302,42 +3807,43 @@ def crop_bbox(
 
 
 # ============================================================
-# 30. Tool evidence formatter
+# 49. Tool context
 # ============================================================
 
 def format_detections(
     title,
     detections,
-    limit=8,
 ):
-
-    if not detections:
-
-        return (
-            f"{title}:\n"
-            "- no reliable detections"
-        )
-
 
     lines = [
         f"{title}:"
     ]
 
 
-    for det in (
+    if not detections:
+
+        lines.append(
+            "- no reliable detection"
+        )
+
+
+        return "\n".join(
+            lines
+        )
+
+
+    for item in (
         detections[
-            :limit
+            :8
         ]
     ):
 
         lines.append(
 
             "- "
-            f"{det['label']} "
-            f"(confidence "
-            f"{det['confidence']:.2f}, "
-            f"position "
-            f"{det['position']})"
+            f"{item['label']} "
+            f"(confidence={item['confidence']:.2f}, "
+            f"position={item['position']})"
         )
 
 
@@ -2346,63 +3852,22 @@ def format_detections(
     )
 
 
-def build_tool_context(
-    general_results,
-    material_results,
-):
-
-    sections = []
-
-
-    if general_results is not None:
-
-        sections.append(
-
-            format_detections(
-                "General object detector",
-
-                general_results,
-            )
-        )
-
-
-    if material_results is not None:
-
-        sections.append(
-
-            format_detections(
-                "Recycling material detector",
-
-                material_results,
-            )
-        )
-
-
-    return "\n\n".join(
-        sections
-    )
-
-
-# ============================================================
-# 31. Run Tool Layer
-# ============================================================
-
-def run_visual_tools(
+def run_tools(
     image,
     tools,
 ):
 
-    general_results = None
+    general = []
 
-    material_results = None
+    material = []
 
 
     if (
-        "general_yolo"
+        "general"
         in tools
     ):
 
-        general_results = (
+        general = (
             run_general_yolo(
                 image
             )
@@ -2410,44 +3875,63 @@ def run_visual_tools(
 
 
     if (
-        "material_yolo"
+        "material"
         in tools
     ):
 
-        material_results = (
+        material = (
             run_material_yolo(
                 image
             )
         )
 
 
+    sections = []
+
+
+    if "general" in tools:
+
+        sections.append(
+
+            format_detections(
+
+                "General detector",
+
+                general,
+            )
+        )
+
+
+    if "material" in tools:
+
+        sections.append(
+
+            format_detections(
+
+                "Material detector",
+
+                material,
+            )
+        )
+
+
+    context = "\n\n".join(
+        sections
+    )
+
+
     crops = []
 
 
-    if (
-        "crop"
-        in tools
-    ):
+    if "crop" in tools:
 
-        # Material detection 우선
-        candidates = []
-
-
-        if material_results:
-
-            candidates.extend(
-                material_results
-            )
+        candidates = (
+            material
+            +
+            general
+        )
 
 
-        if general_results:
-
-            candidates.extend(
-                general_results
-            )
-
-
-        # confidence 높은 순
         candidates.sort(
 
             key=lambda x:
@@ -2459,19 +3943,74 @@ def run_visual_tools(
         )
 
 
+        centers = []
+
+
         for candidate in (
-            candidates[
-                :MAX_CROPS_PER_SAMPLE
-            ]
+            candidates
         ):
+
+            bbox = (
+                candidate[
+                    "bbox"
+                ]
+            )
+
+
+            center = (
+                (
+                    bbox[0]
+                    +
+                    bbox[2]
+                )
+                / 2,
+
+                (
+                    bbox[1]
+                    +
+                    bbox[3]
+                )
+                / 2,
+            )
+
+
+            duplicate = any(
+
+                (
+                    (
+                        center[0]
+                        -
+                        old[0]
+                    )
+                    ** 2
+
+                    +
+
+                    (
+                        center[1]
+                        -
+                        old[1]
+                    )
+                    ** 2
+                )
+                ** 0.5
+                < 30
+
+                for old
+                in centers
+            )
+
+
+            if duplicate:
+
+                continue
+
 
             crop = crop_bbox(
 
                 image,
 
-                candidate[
-                    "bbox"
-                ],
+                bbox,
             )
 
 
@@ -2482,165 +4021,74 @@ def run_visual_tools(
                 )
 
 
-    context = (
-        build_tool_context(
+                centers.append(
+                    center
+                )
 
-            general_results,
 
-            material_results,
-        )
-    )
+            if (
+                len(crops)
+                >= MAX_CROPS
+            ):
+
+                break
 
 
     return {
         "general":
-            general_results,
+            general,
 
         "material":
-            material_results,
+            material,
 
         "crops":
             crops,
 
         "context":
             context,
+
+        "evidence":
+            bool(
+                general
+                or material
+                or crops
+            ),
     }
 
 
 # ============================================================
-# 32. Agent prediction
+# 50. Crop feature extraction
+#
+# Only tool-routed samples need this.
 # ============================================================
 
-def agent_predict(
-    row,
-    threshold,
+def extract_crop_features(
+    crops,
 ):
 
-    image = load_rgb_image(
-        row["path"]
-    )
+    features = []
 
 
-    # --------------------------------------------------------
-    # Pass 1
-    # --------------------------------------------------------
+    for crop in crops:
 
-    first = internvl_predict(
+        features.append(
 
-        row,
+            extract_visual_feature(
 
-        [image],
-    )
+                crop,
 
-
-    # --------------------------------------------------------
-    # Router
-    # --------------------------------------------------------
-
-    tools = route_tools(
-
-        row[
-            "question"
-        ],
-
-        first[
-            "margin"
-        ],
-
-        threshold,
-    )
-
-
-    # no tool
-    if not tools:
-
-        return {
-            "first_pred":
-                first["pred"],
-
-            "final_pred":
-                first["pred"],
-
-            "margin":
-                first["margin"],
-
-            "tools":
-                [],
-
-            "context":
-                "",
-
-            "used_second_pass":
-                False,
-        }
-
-
-    # --------------------------------------------------------
-    # Tools
-    # --------------------------------------------------------
-
-    tool_output = (
-        run_visual_tools(
-            image,
-            tools,
+                max_tiles=(
+                    CROP_MAX_TILES
+                ),
+            )
         )
-    )
 
 
-    # Original image always first.
-    # Crops follow.
-    images = (
-        [image]
-        +
-        tool_output[
-            "crops"
-        ]
-    )
-
-
-    # --------------------------------------------------------
-    # Pass 2
-    # --------------------------------------------------------
-
-    second = internvl_predict(
-
-        row,
-
-        images,
-
-        extra_context=(
-            tool_output[
-                "context"
-            ]
-        ),
-    )
-
-
-    return {
-        "first_pred":
-            first["pred"],
-
-        "final_pred":
-            second["pred"],
-
-        "margin":
-            first["margin"],
-
-        "tools":
-            tools,
-
-        "context":
-            tool_output[
-                "context"
-            ],
-
-        "used_second_pass":
-            True,
-    }
+    return features
 
 
 # ============================================================
-# 33. Baseline validation
+# 51. Baseline Validation
 # ============================================================
 
 print(
@@ -2651,138 +4099,43 @@ print(
 baseline_rows = []
 
 
-for idx in tqdm(
+for index in tqdm(
+
     range(
-        len(valid_subset)
-    ),
-    desc="Baseline validation",
-):
-
-    row = (
-        valid_subset.iloc[
-            idx
-        ]
-    )
-
-
-    image = load_rgb_image(
-        row["path"]
-    )
-
-
-    pred = internvl_predict(
-
-        row,
-
-        [image],
-    )
-
-
-    gold = (
-        str(
-            row["answer"]
+        len(
+            valid_subset
         )
-        .strip()
-        .lower()
-    )
-
-
-    baseline_rows.append(
-        {
-            "id":
-                row["id"],
-
-            "gold":
-                gold,
-
-            "pred":
-                pred["pred"],
-
-            "margin":
-                pred["margin"],
-
-            "correct":
-                pred["pred"]
-                == gold,
-        }
-    )
-
-
-baseline_df = pd.DataFrame(
-    baseline_rows
-)
-
-
-baseline_accuracy = (
-    baseline_df[
-        "correct"
-    ]
-    .mean()
-)
-
-
-print(
-    "InternVL baseline accuracy:",
-    baseline_accuracy
-)
-
-
-# ============================================================
-# 34. Tool Validation
-#
-# Maximum threshold를 사용해 candidate들에 대한
-# second pass를 미리 계산.
-# ============================================================
-
-max_threshold = max(
-    ROUTER_THRESHOLD_CANDIDATES
-)
-
-
-tool_validation_cache = []
-
-
-for idx in tqdm(
-
-    range(
-        len(valid_subset)
     ),
 
-    desc="Tool validation",
+    desc="Flash baseline",
 ):
 
     row = (
         valid_subset.iloc[
-            idx
+            index
         ]
     )
 
 
-    first_data = (
-        baseline_df.iloc[
-            idx
-        ]
+    feature = (
+        load_cached_feature(
+
+            "valid",
+
+            row[
+                "id"
+            ],
+        )
     )
 
 
-    question = (
-        row[
-            "question"
-        ]
-    )
+    result = (
+        predict_from_features(
 
+            row,
 
-    tools = route_tools(
-
-        question,
-
-        float(
-            first_data[
-                "margin"
-            ]
-        ),
-
-        max_threshold,
+            [feature],
+        )
     )
 
 
@@ -2797,332 +4150,578 @@ for idx in tqdm(
     )
 
 
-    if not tools:
-
-        tool_validation_cache.append(
-            {
-                "id":
-                    row["id"],
-
-                "gold":
-                    gold,
-
-                "first_pred":
-                    first_data[
-                        "pred"
-                    ],
-
-                "second_pred":
-                    first_data[
-                        "pred"
-                    ],
-
-                "margin":
-                    float(
-                        first_data[
-                            "margin"
-                        ]
-                    ),
-
-                "tools":
-                    "",
-
-                "context":
-                    "",
-            }
-        )
-
-        continue
-
-
-    image = load_rgb_image(
-        row["path"]
-    )
-
-
-    output = run_visual_tools(
-        image,
-        tools,
-    )
-
-
-    images = (
-        [image]
-        +
-        output[
-            "crops"
-        ]
-    )
-
-
-    second = internvl_predict(
-
-        row,
-
-        images,
-
-        extra_context=(
-            output[
-                "context"
-            ]
-        ),
-    )
-
-
-    tool_validation_cache.append(
+    baseline_rows.append(
         {
             "id":
-                row["id"],
+                row[
+                    "id"
+                ],
 
             "gold":
                 gold,
 
-            "first_pred":
-                first_data[
-                    "pred"
-                ],
-
-            "second_pred":
-                second[
+            "pred":
+                result[
                     "pred"
                 ],
 
             "margin":
-                float(
-                    first_data[
-                        "margin"
-                    ]
-                ),
-
-            "tools":
-                ",".join(
-                    tools
-                ),
-
-            "context":
-                output[
-                    "context"
+                result[
+                    "margin"
                 ],
+
+            "correct":
+                result[
+                    "pred"
+                ]
+                ==
+                gold,
         }
     )
 
 
-tool_val_df = pd.DataFrame(
-    tool_validation_cache
+baseline_df = pd.DataFrame(
+    baseline_rows
 )
 
 
-# ============================================================
-# 35. Router threshold calibration
-# ============================================================
+baseline_accuracy = float(
 
-best_threshold = (
-    ROUTER_MARGIN_THRESHOLD
+    baseline_df[
+        "correct"
+    ]
+    .mean()
 )
 
 
-best_accuracy = (
+print(
+    "Baseline accuracy:",
     baseline_accuracy
 )
 
 
-if CALIBRATE_ROUTER_THRESHOLD:
-
-    print(
-        "\n===== ROUTER CALIBRATION ====="
-    )
-
-
-    for threshold in (
-        ROUTER_THRESHOLD_CANDIDATES
-    ):
-
-        final_predictions = []
-
-
-        for idx in range(
-            len(
-                tool_val_df
-            )
-        ):
-
-            item = (
-                tool_val_df.iloc[
-                    idx
-                ]
-            )
-
-
-            question = (
-                valid_subset.iloc[
-                    idx
-                ][
-                    "question"
-                ]
-            )
-
-
-            tools = route_tools(
-
-                question,
-
-                float(
-                    item[
-                        "margin"
-                    ]
-                ),
-
-                threshold,
-            )
-
-
-            if tools:
-
-                final_predictions.append(
-                    item[
-                        "second_pred"
-                    ]
-                )
-
-            else:
-
-                final_predictions.append(
-                    item[
-                        "first_pred"
-                    ]
-                )
-
-
-        accuracy = sum(
-
-            pred == gold
-
-            for pred, gold
-            in zip(
-
-                final_predictions,
-
-                tool_val_df[
-                    "gold"
-                ],
-            )
-
-        ) / len(
-            final_predictions
-        )
-
-
-        print(
-            f"threshold={threshold:.2f} "
-            f"accuracy={accuracy:.5f}"
-        )
-
-
-        if accuracy > best_accuracy:
-
-            best_accuracy = (
-                accuracy
-            )
-
-            best_threshold = (
-                threshold
-            )
-
-
-print(
-    "\nBaseline:",
-    baseline_accuracy
-)
-
-
-print(
-    "Best Tool Accuracy:",
-    best_accuracy
-)
-
-
-print(
-    "Best threshold:",
-    best_threshold
-)
-
-
 # ============================================================
-# 36. Final validation diagnostics
+# 52. Tool Validation Cache
 # ============================================================
 
-final_val_rows = []
+MAX_THRESHOLD = max(
+    ROUTER_THRESHOLDS
+)
 
 
-for idx in range(
-    len(
-        tool_val_df
-    )
+tool_rows = []
+
+
+for index in tqdm(
+
+    range(
+        len(
+            valid_subset
+        )
+    ),
+
+    desc="YOLO validation",
 ):
 
-    item = (
-        tool_val_df.iloc[
-            idx
+    row = (
+        valid_subset.iloc[
+            index
         ]
     )
 
 
-    question = (
-        valid_subset.iloc[
-            idx
-        ][
-            "question"
+    base = (
+        baseline_df.iloc[
+            index
         ]
     )
 
 
     tools = route_tools(
 
-        question,
+        row[
+            "question"
+        ],
 
         float(
-            item[
+            base[
                 "margin"
             ]
         ),
 
-        best_threshold,
+        MAX_THRESHOLD,
+
+        True,
     )
 
 
-    final_pred = (
+    if not tools:
 
-        item[
-            "second_pred"
-        ]
+        tool_rows.append(
+            {
+                "second_pred":
+                    base[
+                        "pred"
+                    ],
 
-        if tools
+                "tools":
+                    "",
 
-        else item[
-            "first_pred"
+                "evidence":
+                    False,
+
+                "context":
+                    "",
+            }
+        )
+
+
+        continue
+
+
+    image = load_rgb_image(
+        row[
+            "path"
         ]
     )
 
 
-    final_val_rows.append(
+    tool_output = run_tools(
+
+        image,
+
+        tools,
+    )
+
+
+    if not tool_output[
+        "evidence"
+    ]:
+
+        tool_rows.append(
+            {
+                "second_pred":
+                    base[
+                        "pred"
+                    ],
+
+                "tools":
+                    ",".join(
+                        tools
+                    ),
+
+                "evidence":
+                    False,
+
+                "context":
+                    tool_output[
+                        "context"
+                    ],
+            }
+        )
+
+
+        continue
+
+
+    original_feature = (
+        load_cached_feature(
+
+            "valid",
+
+            row[
+                "id"
+            ],
+        )
+    )
+
+
+    crop_features = (
+        extract_crop_features(
+
+            tool_output[
+                "crops"
+            ]
+        )
+    )
+
+
+    all_features = (
+        [original_feature]
+        +
+        crop_features
+    )
+
+
+    second = predict_from_features(
+
+        row,
+
+        all_features,
+
+        tool_context=(
+            tool_output[
+                "context"
+            ]
+        ),
+    )
+
+
+    tool_rows.append(
         {
-            **item.to_dict(),
+            "second_pred":
+                second[
+                    "pred"
+                ],
 
-            "final_pred":
-                final_pred,
+            "tools":
+                ",".join(
+                    tools
+                ),
 
-            "correct":
-                final_pred
-                == item[
-                    "gold"
+            "evidence":
+                True,
+
+            "context":
+                tool_output[
+                    "context"
                 ],
         }
     )
 
 
-pd.DataFrame(
-    final_val_rows
-).to_csv(
+tool_df = pd.DataFrame(
+    tool_rows
+)
+
+
+# ============================================================
+# 53. Router Calibration
+# ============================================================
+
+best_accuracy = (
+    baseline_accuracy
+)
+
+
+best_threshold = None
+
+agent_enabled = False
+
+
+print(
+    "\n===== ROUTER ====="
+)
+
+
+print(
+    f"OFF = "
+    f"{baseline_accuracy:.5f}"
+)
+
+
+for threshold in (
+    ROUTER_THRESHOLDS
+):
+
+    predictions = []
+
+
+    for index in range(
+        len(
+            valid_subset
+        )
+    ):
+
+        row = (
+            valid_subset.iloc[
+                index
+            ]
+        )
+
+
+        base = (
+            baseline_df.iloc[
+                index
+            ]
+        )
+
+
+        cache = (
+            tool_df.iloc[
+                index
+            ]
+        )
+
+
+        tools = route_tools(
+
+            row[
+                "question"
+            ],
+
+            float(
+                base[
+                    "margin"
+                ]
+            ),
+
+            threshold,
+
+            True,
+        )
+
+
+        use_tool = (
+
+            bool(
+                tools
+            )
+
+            and
+
+            bool(
+                cache[
+                    "evidence"
+                ]
+            )
+        )
+
+
+        predictions.append(
+
+            cache[
+                "second_pred"
+            ]
+
+            if use_tool
+
+            else base[
+                "pred"
+            ]
+        )
+
+
+    accuracy = sum(
+
+        p == g
+
+        for p, g
+        in zip(
+
+            predictions,
+
+            baseline_df[
+                "gold"
+            ],
+        )
+
+    ) / len(
+        predictions
+    )
+
+
+    print(
+        f"{threshold:.2f}: "
+        f"{accuracy:.5f}"
+    )
+
+
+    if (
+        accuracy
+        >
+        best_accuracy
+    ):
+
+        best_accuracy = (
+            accuracy
+        )
+
+
+        best_threshold = (
+            threshold
+        )
+
+
+        agent_enabled = (
+            True
+        )
+
+
+print(
+    "Agent enabled:",
+    agent_enabled
+)
+
+print(
+    "Threshold:",
+    best_threshold
+)
+
+print(
+    "Best:",
+    best_accuracy
+)
+
+
+# ============================================================
+# 54. Validation diagnostics
+# ============================================================
+
+validation_rows = []
+
+
+for index in range(
+    len(
+        valid_subset
+    )
+):
+
+    row = (
+        valid_subset.iloc[
+            index
+        ]
+    )
+
+
+    base = (
+        baseline_df.iloc[
+            index
+        ]
+    )
+
+
+    cache = (
+        tool_df.iloc[
+            index
+        ]
+    )
+
+
+    tools = route_tools(
+
+        row[
+            "question"
+        ],
+
+        float(
+            base[
+                "margin"
+            ]
+        ),
+
+        (
+            best_threshold
+            if best_threshold is not None
+            else 0.0
+        ),
+
+        agent_enabled,
+    )
+
+
+    use_tool = (
+
+        bool(
+            tools
+        )
+
+        and
+
+        bool(
+            cache[
+                "evidence"
+            ]
+        )
+    )
+
+
+    final_pred = (
+
+        cache[
+            "second_pred"
+        ]
+
+        if use_tool
+
+        else base[
+            "pred"
+        ]
+    )
+
+
+    validation_rows.append(
+        {
+            "id":
+                row[
+                    "id"
+                ],
+
+            "gold":
+                base[
+                    "gold"
+                ],
+
+            "first_pred":
+                base[
+                    "pred"
+                ],
+
+            "margin":
+                base[
+                    "margin"
+                ],
+
+            "tools":
+                cache[
+                    "tools"
+                ],
+
+            "evidence":
+                cache[
+                    "evidence"
+                ],
+
+            "second_pred":
+                cache[
+                    "second_pred"
+                ],
+
+            "final_pred":
+                final_pred,
+
+            "first_correct":
+                base[
+                    "correct"
+                ],
+
+            "final_correct":
+                final_pred
+                ==
+                base[
+                    "gold"
+                ],
+
+            "context":
+                cache[
+                    "context"
+                ],
+        }
+    )
+
+
+validation_df = pd.DataFrame(
+    validation_rows
+)
+
+
+SUBMISSION_DIR.mkdir(
+    parents=True,
+    exist_ok=True,
+)
+
+
+validation_df.to_csv(
 
     VALIDATION_PATH,
 
@@ -3130,50 +4729,102 @@ pd.DataFrame(
 )
 
 
+fixed = int(
+
+    (
+        (~validation_df["first_correct"])
+        &
+        validation_df["final_correct"]
+    )
+    .sum()
+)
+
+
+broken = int(
+
+    (
+        validation_df["first_correct"]
+        &
+        (~validation_df["final_correct"])
+    )
+    .sum()
+)
+
+
+print(
+    "\nWrong -> Correct:",
+    fixed
+)
+
+print(
+    "Correct -> Wrong:",
+    broken
+)
+
+print(
+    "Net:",
+    fixed - broken
+)
+
+
 # ============================================================
-# 37. TEST — baseline + tools
+# 55. Test inference
 # ============================================================
 
-baseline_test_preds = []
+baseline_predictions = []
 
-agent_test_preds = []
+agent_predictions = []
 
 tool_logs = []
 
 
-for idx in tqdm(
+for index in tqdm(
 
     range(
-        len(test_df)
+        len(
+            test_df
+        )
     ),
 
-    desc="Test Agent",
+    desc="Test",
 ):
 
     row = (
         test_df.iloc[
-            idx
+            index
         ]
     )
 
 
-    image = load_rgb_image(
-        row["path"]
+    original_feature = (
+        load_cached_feature(
+
+            "test",
+
+            row[
+                "id"
+            ],
+        )
     )
 
 
-    first = internvl_predict(
+    first = predict_from_features(
 
         row,
 
-        [image],
+        [original_feature],
     )
 
 
-    baseline_test_preds.append(
+    baseline_pred = (
         first[
             "pred"
         ]
+    )
+
+
+    baseline_predictions.append(
+        baseline_pred
     )
 
 
@@ -3187,63 +4838,40 @@ for idx in tqdm(
             "margin"
         ],
 
-        best_threshold,
+        (
+            best_threshold
+            if best_threshold is not None
+            else 0.0
+        ),
+
+        agent_enabled,
     )
 
 
-    if not tools:
+    final_pred = (
+        baseline_pred
+    )
 
-        final_pred = (
-            first[
-                "pred"
+
+    context = ""
+
+    evidence = False
+
+
+    if tools:
+
+        image = load_rgb_image(
+            row[
+                "path"
             ]
         )
 
 
-        context = ""
+        tool_output = run_tools(
 
-        used_second = False
+            image,
 
-
-    else:
-
-        tool_output = (
-            run_visual_tools(
-                image,
-                tools,
-            )
-        )
-
-
-        images = (
-            [image]
-            +
-            tool_output[
-                "crops"
-            ]
-        )
-
-
-        second = (
-            internvl_predict(
-
-                row,
-
-                images,
-
-                extra_context=(
-                    tool_output[
-                        "context"
-                    ]
-                ),
-            )
-        )
-
-
-        final_pred = (
-            second[
-                "pred"
-            ]
+            tools,
         )
 
 
@@ -3254,10 +4882,57 @@ for idx in tqdm(
         )
 
 
-        used_second = True
+        evidence = bool(
+            tool_output[
+                "evidence"
+            ]
+        )
 
 
-    agent_test_preds.append(
+        if evidence:
+
+            crop_features = (
+                extract_crop_features(
+
+                    tool_output[
+                        "crops"
+                    ]
+                )
+            )
+
+
+            all_features = (
+
+                [original_feature]
+
+                +
+
+                crop_features
+            )
+
+
+            second = (
+                predict_from_features(
+
+                    row,
+
+                    all_features,
+
+                    tool_context=(
+                        context
+                    ),
+                )
+            )
+
+
+            final_pred = (
+                second[
+                    "pred"
+                ]
+            )
+
+
+    agent_predictions.append(
         final_pred
     )
 
@@ -3265,24 +4940,33 @@ for idx in tqdm(
     tool_logs.append(
         {
             "id":
-                row["id"],
+                row[
+                    "id"
+                ],
 
             "first_pred":
-                first["pred"],
+                baseline_pred,
 
-            "first_margin":
-                first["margin"],
+            "margin":
+                first[
+                    "margin"
+                ],
 
             "tools":
                 ",".join(
                     tools
                 ),
 
-            "used_second_pass":
-                used_second,
+            "evidence":
+                evidence,
 
             "final_pred":
                 final_pred,
+
+            "changed":
+                final_pred
+                !=
+                baseline_pred,
 
             "context":
                 context,
@@ -3291,27 +4975,32 @@ for idx in tqdm(
 
 
 # ============================================================
-# 38. Submissions
+# 56. Save submissions
 # ============================================================
 
-SUBMISSION_DIR.mkdir(
-    parents=True,
-    exist_ok=True,
+baseline_submission = pd.DataFrame(
+    {
+        "id":
+            test_df[
+                "id"
+            ],
+
+        "answer":
+            baseline_predictions,
+    }
 )
 
 
-baseline_submission = (
-    pd.DataFrame(
-        {
-            "id":
-                test_df[
-                    "id"
-                ],
+agent_submission = pd.DataFrame(
+    {
+        "id":
+            test_df[
+                "id"
+            ],
 
-            "answer":
-                baseline_test_preds,
-        }
-    )
+        "answer":
+            agent_predictions,
+    }
 )
 
 
@@ -3323,32 +5012,20 @@ baseline_submission.to_csv(
 )
 
 
-agent_submission = (
-    pd.DataFrame(
-        {
-            "id":
-                test_df[
-                    "id"
-                ],
-
-            "answer":
-                agent_test_preds,
-        }
-    )
-)
-
-
 agent_submission.to_csv(
 
-    SUBMISSION_PATH,
+    AGENT_SUBMISSION_PATH,
 
     index=False,
 )
 
 
-pd.DataFrame(
+tool_log_df = pd.DataFrame(
     tool_logs
-).to_csv(
+)
+
+
+tool_log_df.to_csv(
 
     TOOL_LOG_PATH,
 
@@ -3357,31 +5034,52 @@ pd.DataFrame(
 
 
 # ============================================================
-# 39. Diagnostics
+# 57. Final checks
 # ============================================================
 
-changed = sum(
-
-    a != b
-
-    for a, b
-    in zip(
-
-        baseline_test_preds,
-
-        agent_test_preds,
+if (
+    len(
+        agent_submission
     )
-)
+    !=
+    len(
+        test_df
+    )
+):
 
+    raise RuntimeError(
+        "Submission row count mismatch."
+    )
+
+
+if not set(
+
+    agent_submission[
+        "answer"
+    ].unique()
+
+).issubset(
+    VALID_CHOICES
+):
+
+    raise RuntimeError(
+        "Invalid prediction."
+    )
+
+
+# ============================================================
+# 58. Final report
+# ============================================================
 
 print(
     "\n"
-    + "=" * 70
+    +
+    "=" * 70
 )
 
 
 print(
-    "SSAFY-AGENT RESULT"
+    "SSAFY-Agent v3"
 )
 
 
@@ -3391,75 +5089,108 @@ print(
 
 
 print(
-    "InternVL baseline validation:",
-    baseline_accuracy
+    "Model:",
+    MODEL_ID
 )
 
 
 print(
-    "Tool validation:",
-    best_accuracy
+    "Vision mode:"
+)
+
+print(
+    "  Flash"
+)
+
+print(
+    "  tile=1"
+)
+
+print(
+    "  cached"
 )
 
 
 print(
-    "Selected threshold:",
+    "Train:",
+    len(
+        train_subset
+    )
+)
+
+
+print(
+    "Valid:",
+    len(
+        valid_subset
+    )
+)
+
+
+print(
+    "LoRA:",
+    f"r={LORA_R}, "
+    f"alpha={LORA_ALPHA}"
+)
+
+
+print(
+    "Baseline validation:",
+    f"{baseline_accuracy:.5f}"
+)
+
+
+print(
+    "Agent validation:",
+    f"{best_accuracy:.5f}"
+)
+
+
+print(
+    "Agent enabled:",
+    agent_enabled
+)
+
+
+print(
+    "Router threshold:",
     best_threshold
 )
 
 
 print(
-    "Test predictions changed:",
-    changed
+    "Wrong -> Correct:",
+    fixed
 )
 
 
 print(
-    "Change ratio:",
-    changed
-    /
-    len(test_df)
+    "Correct -> Wrong:",
+    broken
 )
 
 
 print(
-    "\nBaseline submission:"
+    "Net tool gain:",
+    fixed - broken
 )
 
+
 print(
+    "Baseline submission:",
     BASELINE_SUBMISSION_PATH
 )
 
 
 print(
-    "\nAgent submission:"
-)
-
-print(
-    SUBMISSION_PATH
+    "Agent submission:",
+    AGENT_SUBMISSION_PATH
 )
 
 
 print(
-    "\nTool diagnostics:"
-)
-
-print(
-    TOOL_LOG_PATH
-)
-
-
-print(
-    "\nFinal distribution:"
-)
-
-
-print(
-    pd.Series(
-        agent_test_preds
-    )
-    .value_counts()
-    .sort_index()
+    "Feature cache:",
+    FEATURE_CACHE_DIR
 )
 
 
