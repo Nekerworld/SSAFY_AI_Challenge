@@ -1,26 +1,51 @@
 # ============================================================
-# Qwen3-VL-2B + 4bit QLoRA
-# SSAFY Recycling VQA Multiple Choice
+# SSAFY-T+ Ensemble
+# Surprise-Sensitive Adaptive Framework for Your Answers
+# with Titans
 #
-# Features
+# Qwen3-VL-2B + Qwen3-VL-4B
+#
 # ------------------------------------------------------------
-# 1. Gold train 90/10 stratified split
-# 2. Qwen3-VL-2B-Instruct
-# 3. 4bit NF4 QLoRA
-# 4. Language-model LoRA only
-# 5. Direct 4-choice Cross Entropy
-# 6. Hard-negative margin loss
-# 7. Titans-inspired surprise replay
-# 8. Batched validation / test inference
-# 9. logits_to_keep=1 for memory/speed
-# 10. Confidence-based high-resolution second pass
-# 11. Validation-based second-pass threshold calibration
-# 12. Optional dev pseudo-label Stage 2
-#     - human agreement >= 4/5
-#     - teacher prediction agreement
-#     - teacher confidence margin
-# 13. Best checkpoint restoration
-# 14. Final submission + diagnostic logits
+# Existing SSAFY-T
+# ------------------------------------------------------------
+# 1. Qwen3-VL 2B + 4B sequential training
+# 2. 4-bit NF4 QLoRA
+# 3. Language LoRA + last-N Vision LoRA
+# 4. Direct 4-choice Cross Entropy
+# 5. Hard-negative margin loss
+# 6. Titans-inspired Surprise Replay
+# 7. Random option permutation training
+# 8. Multi-permutation inference ensemble
+# 9. Confidence-based high-resolution second pass
+# 10. DEV human/teacher pseudo-label Stage 2
+# 11. Validation-calibrated 2B/4B ensemble
+#
+# ------------------------------------------------------------
+# Added in SSAFY-T+
+# ------------------------------------------------------------
+# 12. Train-only weak image augmentation
+#     - brightness / contrast
+#     - tiny crop
+#     - JPEG noise
+#     - weak blur
+#
+# 13. Semantic Candidate Scorer
+#     - actual option text
+#     - candidate verification via yes/no logits
+#     - position-independent semantic scoring
+#
+# 14. Validation-calibrated
+#     letter-score + semantic-score fusion
+#
+# 15. FINAL GOLD 100% RETRAINING
+#     - validation used only for model selection
+#     - once all hyperparameters are fixed:
+#       reload pretrained model
+#       train on 100% gold
+#       optionally apply selected pseudo stage
+#       infer test
+#     - validation is NOT inspected again
+#
 # ============================================================
 
 
@@ -28,19 +53,26 @@
 # 0. Imports
 # ============================================================
 
-import os
+import gc
+import io
 import math
 import random
+import re
+
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Any, Optional
 
 import numpy as np
 import pandas as pd
 
-from PIL import Image
+from PIL import (
+    Image,
+    ImageEnhance,
+    ImageFilter,
+)
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 from torch.utils.data import (
@@ -49,7 +81,9 @@ from torch.utils.data import (
     Subset,
 )
 
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import (
+    train_test_split,
+)
 
 from transformers import (
     Qwen3VLForConditionalGeneration,
@@ -70,7 +104,7 @@ from tqdm.auto import tqdm
 
 
 # ============================================================
-# 1. Project / Config
+# 1. Project
 # ============================================================
 
 try:
@@ -79,145 +113,221 @@ except NameError:
     PROJECT_DIR = Path.cwd().resolve()
 
 
-# ------------------------------------------------------------
-# Model
-# ------------------------------------------------------------
-
-MODEL_ID = "Qwen/Qwen3-VL-2B-Instruct"
-
-
-# ------------------------------------------------------------
-# Reproducibility
-# ------------------------------------------------------------
+# ============================================================
+# 2. Global config
+# ============================================================
 
 SEED = 42
 
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
 
-# ------------------------------------------------------------
-# Train data
-#
-# None = train pool 전체 사용
-#
-# 성능을 목표로 한다면 None 권장
-# ------------------------------------------------------------
+
+# ============================================================
+# 3. Data
+# ============================================================
+
+TRAIN_CSV = PROJECT_DIR / "train.csv"
+DEV_CSV = PROJECT_DIR / "dev.csv"
+TEST_CSV = PROJECT_DIR / "test.csv"
 
 TRAIN_LIMIT = None
 
+VALID_RATIO = 0.10
 
-# ------------------------------------------------------------
-# Image resolution
-#
-# Pass 1:
-# 비교적 저렴한 해상도
-#
-# Pass 2:
-# confidence가 낮은 문제만 고해상도
-# ------------------------------------------------------------
+
+# ============================================================
+# 4. Image resolution
+# ============================================================
 
 LOW_MIN_PIXELS = 224 * 224
-LOW_MAX_PIXELS = 384 * 384
+LOW_MAX_PIXELS = 448 * 448
 
 HIGH_MIN_PIXELS = 256 * 28 * 28
 HIGH_MAX_PIXELS = 768 * 28 * 28
 
 
-# ------------------------------------------------------------
-# Stage 1 training
-#
-# 전체 4,500개 정도를 쓰므로 예전의 200개 × 20epoch보다
-# epoch 수를 훨씬 줄이는 것이 적절함.
-# ------------------------------------------------------------
+# ============================================================
+# 5. Models
+# ============================================================
+
+MODEL_CONFIGS = [
+    {
+        "name": "2b",
+        "model_id": "Qwen/Qwen3-VL-2B-Instruct",
+
+        "train_batch_size": 8,
+        "eval_batch_size": 8,
+
+        # semantic scorer expands each example ×4
+        "semantic_batch_size": 2,
+
+        "grad_accum": 2,
+
+        "language_lr": 1e-4,
+        "vision_lr": 1e-5,
+
+        "vision_lora_blocks": 4,
+    },
+
+    {
+        "name": "4b",
+        "model_id": "Qwen/Qwen3-VL-4B-Instruct",
+
+        "train_batch_size": 4,
+        "eval_batch_size": 4,
+
+        "semantic_batch_size": 1,
+
+        "grad_accum": 4,
+
+        "language_lr": 8e-5,
+        "vision_lr": 8e-6,
+
+        "vision_lora_blocks": 4,
+    },
+]
+
+
+# ============================================================
+# 6. Stage 1
+# ============================================================
 
 NUM_EPOCHS = 8
-
 EVAL_EVERY = 2
 
 
-# ------------------------------------------------------------
-# RTX 3090 Ti 24GB
-#
-# 먼저 batch=8 시도.
-# OOM이면 4로 내릴 것.
-# ------------------------------------------------------------
-
-TRAIN_BATCH_SIZE = 8
-
-VALID_BATCH_SIZE = 8
-
-TEST_BATCH_SIZE = 8
-
-GRAD_ACCUM = 2
-
-
-# ------------------------------------------------------------
-# Optimizer
-# ------------------------------------------------------------
-
-LR = 1e-4
+# ============================================================
+# 7. Optimizer
+# ============================================================
 
 WEIGHT_DECAY = 0.01
-
 MAX_GRAD_NORM = 1.0
-
 WARMUP_RATIO = 0.03
 
 
-# ------------------------------------------------------------
-# LoRA
-# ------------------------------------------------------------
+# ============================================================
+# 8. LoRA
+# ============================================================
 
 LORA_R = 8
-
 LORA_ALPHA = 16
-
 LORA_DROPOUT = 0.05
 
 
 # ============================================================
-# 2. MC loss
+# 9. MC objective
 # ============================================================
-
-# 4-choice CE가 primary objective
 
 MC_CE_WEIGHT = 1.0
 
-
-# ------------------------------------------------------------
-# Hard-negative ranking
-#
-# correct logit이 hardest wrong보다
-# 최소 MARGIN 만큼 높게 만들기
-# ------------------------------------------------------------
-
 USE_MARGIN_LOSS = True
 
-MARGIN_LOSS_WEIGHT = 0.20
-
 MARGIN = 1.0
+MARGIN_LOSS_WEIGHT = 0.20
 
 
 # ============================================================
-# 3. Surprise Replay
-#
-# Titans의 surprise-memory 개념을
-# hard-example replay로 단순화
+# 10. Surprise Replay
 # ============================================================
 
 USE_SURPRISE_REPLAY = True
 
 SURPRISE_REPLAY_RATIO = 0.25
-
 SURPRISE_EMA_BETA = 0.80
 
 
 # ============================================================
-# 4. Second-pass inference
+# 11. Option permutation
+# ============================================================
+
+USE_TRAIN_PERMUTATION = True
+TRAIN_PERMUTATION_PROB = 1.0
+
+USE_PERMUTATION_INFERENCE = True
+
+PERMUTATIONS = [
+    (0, 1, 2, 3),
+    (1, 2, 3, 0),
+    (2, 3, 0, 1),
+    (3, 0, 1, 2),
+]
+
+
+# ============================================================
+# 12. Weak Image Augmentation
+# ============================================================
+
+USE_AUGMENTATION = True
+
+# 전체 augmentation 적용 여부
+AUGMENT_PROB = 0.70
+
+BRIGHTNESS_PROB = 0.35
+CONTRAST_PROB = 0.35
+
+TINY_CROP_PROB = 0.25
+
+JPEG_PROB = 0.20
+BLUR_PROB = 0.12
+
+BRIGHTNESS_RANGE = (
+    0.94,
+    1.06,
+)
+
+CONTRAST_RANGE = (
+    0.94,
+    1.06,
+)
+
+# 가장자리 최대 3%
+TINY_CROP_MAX_RATIO = 0.03
+
+JPEG_QUALITY_RANGE = (
+    90,
+    98,
+)
+
+BLUR_RADIUS_RANGE = (
+    0.10,
+    0.55,
+)
+
+
+# 색상 질문에서는 brightness/contrast 최소화
+COLOR_KEYWORDS = [
+    "색",
+    "색상",
+    "무슨 색",
+    "color",
+]
+
+# 위치/개수 질문에서는 crop 금지
+SPATIAL_COUNT_KEYWORDS = [
+    "왼쪽",
+    "오른쪽",
+    "위쪽",
+    "아래쪽",
+    "좌측",
+    "우측",
+    "몇 개",
+    "몇개",
+    "개수",
+    "수량",
+    "left",
+    "right",
+    "how many",
+    "number of",
+]
+
+
+# ============================================================
+# 13. Second Pass
 # ============================================================
 
 USE_SECOND_PASS = True
-
-
-# validation에서 탐색할 margin threshold
 
 SECOND_PASS_THRESHOLDS = [
     0.0,
@@ -230,121 +340,126 @@ SECOND_PASS_THRESHOLDS = [
     2.00,
 ]
 
-
-# 높은 해상도 second-pass logit 비중
-
 SECOND_PASS_WEIGHT = 0.70
 
 
 # ============================================================
-# 5. Optional DEV pseudo-label Stage 2
+# 14. DEV pseudo stage
 # ============================================================
 
 USE_DEV_PSEUDO_STAGE = True
 
-
-# 사람 5명 중 최소 4명 일치
-
 PSEUDO_MIN_HUMAN_CONF = 0.80
-
-
-# teacher top1-top2 margin
-
 PSEUDO_MIN_TEACHER_MARGIN = 1.0
-
-
-# pseudo label의 loss 영향
 
 PSEUDO_BASE_WEIGHT = 0.50
 
-
-# Stage 2
-
 PSEUDO_EPOCHS = 2
 
-PSEUDO_LR = 2e-5
+PSEUDO_LR_FACTOR = 0.20
 
 
 # ============================================================
-# 6. Paths
+# 15. Semantic candidate scorer
 # ============================================================
 
-TRAIN_CSV = PROJECT_DIR / "train.csv"
+USE_SEMANTIC_SCORER = True
 
-DEV_CSV = PROJECT_DIR / "dev.csv"
+# semantic weight:
+#
+# final =
+# (1 - semantic_weight) * letter_logp
+# +
+# semantic_weight * semantic_logp
 
-TEST_CSV = PROJECT_DIR / "test.csv"
+SEMANTIC_WEIGHTS = [
+    0.00,
+    0.05,
+    0.10,
+    0.15,
+    0.20,
+    0.25,
+    0.30,
+    0.35,
+    0.40,
+    0.45,
+    0.50,
+]
 
 
-SAVE_DIR = (
+# ============================================================
+# 16. 2B/4B ensemble
+# ============================================================
+
+ENSEMBLE_WEIGHTS_2B = [
+    x / 20
+    for x in range(21)
+]
+
+
+# ============================================================
+# 17. Final Gold 100% retraining
+# ============================================================
+
+USE_FINAL_FULL_GOLD_RETRAIN = True
+
+# final retraining에서도
+# Stage1 best epoch 수를 그대로 사용.
+#
+# validation은 절대 다시 보지 않는다.
+FINAL_USE_SELECTED_PSEUDO_STAGE = True
+
+
+# ============================================================
+# 18. Paths
+# ============================================================
+
+MODEL_ROOT = (
     PROJECT_DIR
     / "model"
-    / "qwen3_vl_2b_vqa"
 )
-
 
 SUBMISSION_DIR = (
     PROJECT_DIR
     / "submission"
 )
 
-
-SUBMISSION_PATH = (
+FINAL_SUBMISSION_PATH = (
     SUBMISSION_DIR
-    / "submission.csv"
+    / "submission_ssafy_t_plus.csv"
 )
 
-
-VALIDATION_PREDICTION_PATH = (
+FINAL_LOGIT_PATH = (
     SUBMISSION_DIR
-    / "validation_predictions.csv"
+    / "ssafy_t_plus_logits.csv"
 )
 
-
-TEST_LOGIT_PATH = (
+ENSEMBLE_VALIDATION_PATH = (
     SUBMISSION_DIR
-    / "prediction_logits.csv"
+    / "ssafy_t_plus_validation.csv"
 )
-
-
-PSEUDO_PATH = (
-    SUBMISSION_DIR
-    / "dev_pseudo_labels.csv"
-)
-
 
 Image.MAX_IMAGE_PIXELS = None
 
 
 # ============================================================
-# 7. Seeds / CUDA
+# 19. CUDA
 # ============================================================
-
-random.seed(SEED)
-
-np.random.seed(SEED)
-
-torch.manual_seed(SEED)
-
 
 if not torch.cuda.is_available():
     raise RuntimeError(
         "CUDA GPU가 필요합니다."
     )
 
-
 torch.cuda.manual_seed_all(SEED)
-
 
 DEVICE = torch.device(
     "cuda:0"
 )
 
-
 BF16_SUPPORTED = (
     torch.cuda.is_bf16_supported()
 )
-
 
 COMPUTE_DTYPE = (
     torch.bfloat16
@@ -352,36 +467,24 @@ COMPUTE_DTYPE = (
     else torch.float16
 )
 
-
 USE_SCALER = (
     COMPUTE_DTYPE
     == torch.float16
 )
 
-
 print(
-    "Project dir  :",
-    PROJECT_DIR
-)
-
-print(
-    "GPU          :",
+    "GPU:",
     torch.cuda.get_device_name(0)
 )
 
 print(
-    "Compute dtype:",
+    "dtype:",
     COMPUTE_DTYPE
-)
-
-print(
-    "GradScaler   :",
-    USE_SCALER
 )
 
 
 # ============================================================
-# 8. General helpers
+# 20. Choice helpers
 # ============================================================
 
 CHOICES = (
@@ -391,18 +494,15 @@ CHOICES = (
     "d",
 )
 
-
 CHOICE_TO_INDEX = {
-    choice: idx
-    for idx, choice
+    c: i
+    for i, c
     in enumerate(CHOICES)
 }
-
 
 VALID_CHOICES = set(
     CHOICES
 )
-
 
 DEV_ANSWER_COLS = [
     "answer1",
@@ -412,6 +512,10 @@ DEV_ANSWER_COLS = [
     "answer5",
 ]
 
+
+# ============================================================
+# 21. File helpers
+# ============================================================
 
 def resolve_image_path(
     path_value,
@@ -439,11 +543,9 @@ def load_rgb_image(
         path_value
     )
 
-    with Image.open(
-        path
-    ) as image:
+    with Image.open(path) as img:
 
-        return image.convert(
+        return img.convert(
             "RGB"
         )
 
@@ -455,10 +557,10 @@ def validate_image_paths(
 
     missing = []
 
-    for path_value in df["path"]:
+    for value in df["path"]:
 
         path = resolve_image_path(
-            path_value
+            value
         )
 
         if not path.exists():
@@ -473,9 +575,21 @@ def validate_image_paths(
     if missing:
 
         raise FileNotFoundError(
-            f"{name} 이미지 누락:\n"
+            f"{name} missing images:\n"
             + "\n".join(missing)
         )
+
+
+def sanitize_inputs(
+    inputs,
+):
+
+    inputs.pop(
+        "token_type_ids",
+        None,
+    )
+
+    return inputs
 
 
 def autocast_context():
@@ -486,23 +600,260 @@ def autocast_context():
     )
 
 
-def sanitize_inputs(
-    inputs,
+# ============================================================
+# 22. Augmentation
+# ============================================================
+
+def contains_keyword(
+    question,
+    keywords,
 ):
 
-    # Qwen3-VL 환경에 따라 processor가
-    # token_type_ids를 만들 수 있음.
+    text = str(
+        question
+    ).lower()
 
-    inputs.pop(
-        "token_type_ids",
-        None,
+    return any(
+        keyword.lower() in text
+        for keyword
+        in keywords
     )
 
-    return inputs
+
+def tiny_crop(
+    image,
+):
+
+    width, height = (
+        image.size
+    )
+
+    max_crop_x = max(
+        1,
+        int(
+            width
+            * TINY_CROP_MAX_RATIO
+        ),
+    )
+
+    max_crop_y = max(
+        1,
+        int(
+            height
+            * TINY_CROP_MAX_RATIO
+        ),
+    )
+
+    left = random.randint(
+        0,
+        max_crop_x,
+    )
+
+    right = random.randint(
+        0,
+        max_crop_x,
+    )
+
+    top = random.randint(
+        0,
+        max_crop_y,
+    )
+
+    bottom = random.randint(
+        0,
+        max_crop_y,
+    )
+
+    crop_right = max(
+        left + 2,
+        width - right,
+    )
+
+    crop_bottom = max(
+        top + 2,
+        height - bottom,
+    )
+
+    cropped = image.crop(
+        (
+            left,
+            top,
+            crop_right,
+            crop_bottom,
+        )
+    )
+
+    return cropped.resize(
+        (
+            width,
+            height,
+        ),
+        resample=(
+            Image.Resampling.BICUBIC
+        ),
+    )
+
+
+def jpeg_noise(
+    image,
+):
+
+    quality = random.randint(
+        JPEG_QUALITY_RANGE[0],
+        JPEG_QUALITY_RANGE[1],
+    )
+
+    buffer = io.BytesIO()
+
+    image.save(
+        buffer,
+        format="JPEG",
+        quality=quality,
+    )
+
+    buffer.seek(0)
+
+    with Image.open(
+        buffer
+    ) as decoded:
+
+        output = decoded.convert(
+            "RGB"
+        ).copy()
+
+    buffer.close()
+
+    return output
+
+
+def augment_training_image(
+    image,
+    question,
+):
+
+    if not USE_AUGMENTATION:
+
+        return image
+
+    if random.random() > AUGMENT_PROB:
+
+        return image
+
+    img = image.copy()
+
+    color_sensitive = (
+        contains_keyword(
+            question,
+            COLOR_KEYWORDS,
+        )
+    )
+
+    spatial_sensitive = (
+        contains_keyword(
+            question,
+            SPATIAL_COUNT_KEYWORDS,
+        )
+    )
+
+    # --------------------------------------------------------
+    # Brightness
+    # --------------------------------------------------------
+
+    brightness_prob = (
+        BRIGHTNESS_PROB
+        * (
+            0.25
+            if color_sensitive
+            else 1.0
+        )
+    )
+
+    if random.random() < brightness_prob:
+
+        factor = random.uniform(
+            *BRIGHTNESS_RANGE
+        )
+
+        img = (
+            ImageEnhance
+            .Brightness(img)
+            .enhance(factor)
+        )
+
+
+    # --------------------------------------------------------
+    # Contrast
+    # --------------------------------------------------------
+
+    contrast_prob = (
+        CONTRAST_PROB
+        * (
+            0.40
+            if color_sensitive
+            else 1.0
+        )
+    )
+
+    if random.random() < contrast_prob:
+
+        factor = random.uniform(
+            *CONTRAST_RANGE
+        )
+
+        img = (
+            ImageEnhance
+            .Contrast(img)
+            .enhance(factor)
+        )
+
+
+    # --------------------------------------------------------
+    # Tiny crop
+    # --------------------------------------------------------
+
+    if (
+        not spatial_sensitive
+        and random.random()
+        < TINY_CROP_PROB
+    ):
+
+        img = tiny_crop(
+            img
+        )
+
+
+    # --------------------------------------------------------
+    # JPEG noise
+    # --------------------------------------------------------
+
+    if random.random() < JPEG_PROB:
+
+        img = jpeg_noise(
+            img
+        )
+
+
+    # --------------------------------------------------------
+    # Blur
+    # --------------------------------------------------------
+
+    if random.random() < BLUR_PROB:
+
+        radius = random.uniform(
+            *BLUR_RADIUS_RANGE
+        )
+
+        img = img.filter(
+            ImageFilter.GaussianBlur(
+                radius=radius
+            )
+        )
+
+    return img
 
 
 # ============================================================
-# 9. Load CSV
+# 23. Load CSV
 # ============================================================
 
 train_df = pd.read_csv(
@@ -529,7 +880,6 @@ TRAIN_REQUIRED = {
     "answer",
 }
 
-
 DEV_REQUIRED = {
     "id",
     "path",
@@ -540,7 +890,6 @@ DEV_REQUIRED = {
     "d",
     *DEV_ANSWER_COLS,
 }
-
 
 TEST_REQUIRED = {
     "id",
@@ -590,50 +939,49 @@ require_columns(
     "test.csv",
 )
 
-
 validate_image_paths(
     train_df,
-    "train"
+    "train",
 )
 
 validate_image_paths(
     dev_df,
-    "dev"
+    "dev",
 )
 
 validate_image_paths(
     test_df,
-    "test"
+    "test",
 )
 
 
 # ============================================================
-# 10. Train / Validation split
-#
-# validation은 절대 pseudo training에 넣지 않음
+# 24. Fixed development split
 # ============================================================
 
 train_pool, valid_subset = (
     train_test_split(
         train_df,
-        test_size=0.10,
+
+        test_size=VALID_RATIO,
+
         random_state=SEED,
-        stratify=train_df["answer"],
+
+        stratify=train_df[
+            "answer"
+        ],
     )
 )
-
 
 train_pool = (
     train_pool
     .reset_index(drop=True)
 )
 
-
 valid_subset = (
     valid_subset
     .reset_index(drop=True)
 )
-
 
 test_df = (
     test_df
@@ -641,23 +989,20 @@ test_df = (
 )
 
 
-# ============================================================
-# 11. Optional train limit
-# ============================================================
-
 if (
     TRAIN_LIMIT is not None
     and TRAIN_LIMIT
     < len(train_pool)
 ):
 
-    # answer 비율 보존
-
     train_subset, _ = (
         train_test_split(
             train_pool,
+
             train_size=TRAIN_LIMIT,
+
             random_state=SEED,
+
             stratify=train_pool[
                 "answer"
             ],
@@ -676,9 +1021,19 @@ else:
     )
 
 
-# gold sample weight
-
 train_subset[
+    "sample_weight"
+] = 1.0
+
+
+# final training data
+full_gold_df = (
+    train_df
+    .reset_index(drop=True)
+    .copy()
+)
+
+full_gold_df[
     "sample_weight"
 ] = 1.0
 
@@ -688,232 +1043,150 @@ print(
 )
 
 print(
-    "Original train:",
+    "Gold total:",
     len(train_df)
 )
 
 print(
-    "Train pool    :",
-    len(train_pool)
-)
-
-print(
-    "Train used    :",
+    "Dev train:",
     len(train_subset)
 )
 
 print(
-    "Validation    :",
+    "Validation:",
     len(valid_subset)
 )
 
 print(
-    "Dev           :",
+    "DEV:",
     len(dev_df)
 )
 
 print(
-    "Test          :",
+    "Test:",
     len(test_df)
 )
 
 
 # ============================================================
-# 12. Processor
-#
-# 중요:
-# padding_side='left'
-#
-# 이렇게 하면 batch에서도 마지막 token이
-# 모든 샘플의 실제 generation position이 된다.
-#
-# 그 결과 logits_to_keep=1 사용 가능.
+# 25. Option permutation
 # ============================================================
 
-processor = (
-    AutoProcessor.from_pretrained(
-        MODEL_ID,
-        min_pixels=LOW_MIN_PIXELS,
-        max_pixels=LOW_MAX_PIXELS,
-        trust_remote_code=True,
-    )
-)
+def random_permutation():
 
-
-high_processor = (
-    AutoProcessor.from_pretrained(
-        MODEL_ID,
-        min_pixels=HIGH_MIN_PIXELS,
-        max_pixels=HIGH_MAX_PIXELS,
-        trust_remote_code=True,
-    )
-)
-
-
-for proc in [
-    processor,
-    high_processor,
-]:
-
-    proc.tokenizer.padding_side = (
-        "left"
+    values = list(
+        range(4)
     )
 
-    if (
-        proc.tokenizer.pad_token_id
-        is None
-    ):
-
-        proc.tokenizer.pad_token = (
-            proc.tokenizer.eos_token
-        )
-
-
-print(
-    "Padding side:",
-    processor.tokenizer.padding_side
-)
-
-
-# ============================================================
-# 13. Model
-# ============================================================
-
-bnb_config = BitsAndBytesConfig(
-    load_in_4bit=True,
-    bnb_4bit_use_double_quant=True,
-    bnb_4bit_quant_type="nf4",
-    bnb_4bit_compute_dtype=(
-        COMPUTE_DTYPE
-    ),
-)
-
-
-base_model = (
-    Qwen3VLForConditionalGeneration
-    .from_pretrained(
-        MODEL_ID,
-
-        quantization_config=(
-            bnb_config
-        ),
-
-        device_map={
-            "": 0
-        },
-
-        trust_remote_code=True,
-
-        # Windows에서 flash-attn 설치 문제를 피하면서
-        # PyTorch SDPA 사용
-        attn_implementation="sdpa",
+    random.shuffle(
+        values
     )
-)
 
-
-base_model.config.use_cache = False
-
-
-base_model = (
-    prepare_model_for_kbit_training(
-        base_model,
-        use_gradient_checkpointing=True,
+    return tuple(
+        values
     )
-)
 
 
-# ============================================================
-# 14. Language-only LoRA
-# ============================================================
-
-LLM_TARGET_SUFFIXES = (
-    "self_attn.q_proj",
-    "self_attn.k_proj",
-    "self_attn.v_proj",
-    "self_attn.o_proj",
-    "mlp.gate_proj",
-    "mlp.up_proj",
-    "mlp.down_proj",
-)
-
-
-target_modules = []
-
-
-for name, module in (
-    base_model.named_modules()
+def permute_row(
+    row,
+    permutation,
+    has_answer=True,
 ):
 
-    lower = name.lower()
+    record = (
+        row.to_dict()
+        if hasattr(
+            row,
+            "to_dict",
+        )
+        else dict(row)
+    )
 
-    if (
-        "vision" in lower
-        or "visual" in lower
+    original_options = [
+        str(
+            record[c]
+        )
+        for c in CHOICES
+    ]
+
+    result = dict(
+        record
+    )
+
+    for new_position, original_position in enumerate(
+        permutation
     ):
-        continue
 
-    if any(
-        name.endswith(suffix)
-        for suffix
-        in LLM_TARGET_SUFFIXES
-    ):
+        result[
+            CHOICES[
+                new_position
+            ]
+        ] = original_options[
+            original_position
+        ]
 
-        target_modules.append(
-            name
+    if has_answer:
+
+        old_answer = (
+            str(
+                record[
+                    "answer"
+                ]
+            )
+            .strip()
+            .lower()
         )
 
+        old_index = (
+            CHOICE_TO_INDEX[
+                old_answer
+            ]
+        )
 
-target_modules = sorted(
-    set(target_modules)
-)
+        new_index = (
+            permutation.index(
+                old_index
+            )
+        )
+
+        result[
+            "answer"
+        ] = CHOICES[
+            new_index
+        ]
+
+    return result
 
 
-if not target_modules:
+def restore_logits_to_original_order(
+    logits,
+    permutation,
+):
 
-    raise RuntimeError(
-        "LoRA target module을 "
-        "찾지 못했습니다."
+    restored = torch.empty_like(
+        logits
     )
 
+    for new_position, original_position in enumerate(
+        permutation
+    ):
 
-print(
-    "\nLoRA target count:",
-    len(target_modules)
-)
+        restored[
+            :,
+            original_position
+        ] = logits[
+            :,
+            new_position
+        ]
 
-
-for name in target_modules[:20]:
-
-    print(
-        " ",
-        name
-    )
-
-
-lora_config = LoraConfig(
-    r=LORA_R,
-    lora_alpha=LORA_ALPHA,
-    lora_dropout=LORA_DROPOUT,
-    bias="none",
-    target_modules=target_modules,
-    task_type="CAUSAL_LM",
-)
-
-
-model = get_peft_model(
-    base_model,
-    lora_config,
-)
-
-
-model.print_trainable_parameters()
+    return restored
 
 
 # ============================================================
-# 15. Prompt
+# 26. Letter prompt
 # ============================================================
 
-SYSTEM_INSTRUCT = (
+LETTER_SYSTEM = (
     "You are a visual multiple-choice "
     "question answering assistant. "
     "Inspect the image carefully. "
@@ -932,7 +1205,7 @@ def build_mc_prompt(
     focus_choices=None,
 ):
 
-    base = (
+    text = (
         f"{question}\n\n"
         f"(a) {a}\n"
         f"(b) {b}\n"
@@ -942,22 +1215,23 @@ def build_mc_prompt(
 
     if focus_choices is not None:
 
-        x, y = focus_choices
-
-        base += (
-            "\nThe first evaluation was uncertain. "
-            f"Pay particular attention to options "
-            f"{x} and {y}. "
-            "Inspect the visual evidence again and "
-            "choose the better-supported answer.\n"
+        x, y = (
+            focus_choices
         )
 
-    base += (
-        "\n정답을 a, b, c, d 중 "
-        "하나의 소문자 한 글자로만 출력하세요."
+        text += (
+            "\nThe first evaluation was uncertain. "
+            f"Compare options {x} and {y} "
+            "especially carefully. "
+            "Inspect the image again.\n"
+        )
+
+    text += (
+        "\nReturn exactly one lowercase "
+        "letter: a, b, c, or d."
     )
 
-    return base
+    return text
 
 
 def build_prompt_messages(
@@ -966,13 +1240,13 @@ def build_prompt_messages(
     focus_choices=None,
 ):
 
-    user_text = build_mc_prompt(
-        str(row["question"]),
-        str(row["a"]),
-        str(row["b"]),
-        str(row["c"]),
-        str(row["d"]),
-        focus_choices=focus_choices,
+    text = build_mc_prompt(
+        row["question"],
+        row["a"],
+        row["b"],
+        row["c"],
+        row["d"],
+        focus_choices,
     )
 
     return [
@@ -981,10 +1255,11 @@ def build_prompt_messages(
             "content": [
                 {
                     "type": "text",
-                    "text": SYSTEM_INSTRUCT,
+                    "text": LETTER_SYSTEM,
                 }
             ],
         },
+
         {
             "role": "user",
             "content": [
@@ -992,9 +1267,10 @@ def build_prompt_messages(
                     "type": "image",
                     "image": image,
                 },
+
                 {
                     "type": "text",
-                    "text": user_text,
+                    "text": text,
                 },
             ],
         },
@@ -1002,2280 +1278,2933 @@ def build_prompt_messages(
 
 
 # ============================================================
-# 16. Discover actual answer token IDs
+# 27. Semantic verifier prompt
 # ============================================================
 
-def discover_choice_token_ids():
+SEMANTIC_SYSTEM = (
+    "You are a visual question answering verifier. "
+    "Given an image, a question, and one candidate answer, "
+    "decide whether that candidate is the best correct answer. "
+    "Reply exactly yes or no. "
+    "Do not explain."
+)
 
-    dummy_image = Image.new(
-        "RGB",
-        (28, 28)
+
+def build_semantic_messages(
+    row,
+    image,
+    candidate_text,
+):
+
+    text = (
+        f"Question:\n"
+        f"{row['question']}\n\n"
+        f"Candidate answer:\n"
+        f"{candidate_text}\n\n"
+        "Is this candidate the correct answer "
+        "according to the image?"
     )
 
-    dummy_row = {
-        "question": "Choose one option.",
-        "a": "A",
-        "b": "B",
-        "c": "C",
-        "d": "D",
-    }
-
-    prompt_messages = (
-        build_prompt_messages(
-            dummy_row,
-            dummy_image,
-        )
-    )
-
-    prompt_text = (
-        processor.apply_chat_template(
-            prompt_messages,
-            tokenize=False,
-            add_generation_prompt=True,
-        )
-    )
-
-    prompt_ids = (
-        processor.tokenizer(
-            prompt_text,
-            add_special_tokens=False,
-        )["input_ids"]
-    )
-
-    result = {}
-
-    for choice in CHOICES:
-
-        full_messages = (
-            prompt_messages
-            + [
+    return [
+        {
+            "role": "system",
+            "content": [
                 {
-                    "role": "assistant",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": choice,
-                        }
-                    ],
+                    "type": "text",
+                    "text": SEMANTIC_SYSTEM,
                 }
-            ]
+            ],
+        },
+
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image",
+                    "image": image,
+                },
+
+                {
+                    "type": "text",
+                    "text": text,
+                },
+            ],
+        },
+    ]
+
+
+# ============================================================
+# 28. LoRA target discovery
+# ============================================================
+
+LANGUAGE_SUFFIXES = (
+    "self_attn.q_proj",
+    "self_attn.k_proj",
+    "self_attn.v_proj",
+    "self_attn.o_proj",
+
+    "mlp.gate_proj",
+    "mlp.up_proj",
+    "mlp.down_proj",
+)
+
+VISION_SUFFIXES = (
+    "qkv",
+    "proj",
+
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+
+    "fc1",
+    "fc2",
+
+    "gate_proj",
+    "up_proj",
+    "down_proj",
+)
+
+
+def is_linear_like(
+    module,
+):
+
+    if isinstance(
+        module,
+        nn.Linear,
+    ):
+
+        return True
+
+    return (
+        "linear"
+        in module.__class__
+        .__name__
+        .lower()
+    )
+
+
+def get_vision_block_index(
+    name,
+):
+
+    patterns = [
+        r"(?:blocks)\.(\d+)\.",
+        r"(?:layers)\.(\d+)\.",
+    ]
+
+    for pattern in patterns:
+
+        match = re.search(
+            pattern,
+            name,
         )
 
-        full_text = (
-            processor.apply_chat_template(
-                full_messages,
-                tokenize=False,
-                add_generation_prompt=False,
+        if match:
+
+            return int(
+                match.group(1)
+            )
+
+    return None
+
+
+def collect_lora_targets(
+    base_model,
+    vision_last_n,
+):
+
+    vision_blocks = []
+
+    for name, _ in (
+        base_model
+        .named_modules()
+    ):
+
+        lower = name.lower()
+
+        if (
+            "vision" not in lower
+            and "visual" not in lower
+        ):
+            continue
+
+        index = (
+            get_vision_block_index(
+                name
             )
         )
 
-        full_ids = (
-            processor.tokenizer(
-                full_text,
-                add_special_tokens=False,
-            )["input_ids"]
+        if index is not None:
+
+            vision_blocks.append(
+                index
+            )
+
+    vision_blocks = sorted(
+        set(
+            vision_blocks
+        )
+    )
+
+    selected_vision = set(
+        vision_blocks[
+            -vision_last_n:
+        ]
+    )
+
+    language_targets = []
+    vision_targets = []
+
+    for name, module in (
+        base_model
+        .named_modules()
+    ):
+
+        if not is_linear_like(
+            module
+        ):
+            continue
+
+        lower = name.lower()
+
+        is_vision = (
+            "vision" in lower
+            or "visual" in lower
+        )
+
+        if not is_vision:
+
+            if any(
+                name.endswith(
+                    suffix
+                )
+                for suffix
+                in LANGUAGE_SUFFIXES
+            ):
+
+                language_targets.append(
+                    name
+                )
+
+            continue
+
+        block_index = (
+            get_vision_block_index(
+                name
+            )
         )
 
         if (
-            full_ids[
-                :len(prompt_ids)
-            ]
-            != prompt_ids
+            block_index
+            not in selected_vision
+        ):
+            continue
+
+        if any(
+            name.endswith(
+                suffix
+            )
+            for suffix
+            in VISION_SUFFIXES
         ):
 
-            raise RuntimeError(
-                "Chat-template prefix mismatch."
+            vision_targets.append(
+                name
             )
 
-        suffix = (
-            full_ids[
-                len(prompt_ids):
-            ]
+    language_targets = sorted(
+        set(
+            language_targets
         )
+    )
 
-        if not suffix:
-
-            raise RuntimeError(
-                f"No token for {choice}"
-            )
-
-        result[
-            choice
-        ] = suffix[0]
-
-        print(
-            f"{choice}: "
-            f"{suffix[0]} -> "
-            f"{processor.tokenizer.decode([suffix[0]])!r}"
+    vision_targets = sorted(
+        set(
+            vision_targets
         )
+    )
 
-    if (
-        len(
-            set(result.values())
+    targets = sorted(
+        set(
+            language_targets
+            + vision_targets
         )
-        != 4
-    ):
+    )
+
+    if not language_targets:
 
         raise RuntimeError(
-            "a/b/c/d가 서로 다른 "
-            "single first token이 아닙니다."
+            "Language LoRA targets not found."
         )
 
-    return result
+    print(
+        "Vision blocks:",
+        vision_blocks
+    )
 
+    print(
+        "Selected vision blocks:",
+        sorted(
+            selected_vision
+        )
+    )
 
-choice_token_ids = (
-    discover_choice_token_ids()
-)
+    print(
+        "Language targets:",
+        len(
+            language_targets
+        )
+    )
 
+    print(
+        "Vision targets:",
+        len(
+            vision_targets
+        )
+    )
 
-CHOICE_TOKEN_TENSOR = torch.tensor(
-    [
-        choice_token_ids[
-            choice
-        ]
-        for choice
-        in CHOICES
-    ],
-    dtype=torch.long,
-    device=DEVICE,
-)
-
-
-print(
-    "Choice token IDs:",
-    choice_token_ids
-)
+    return (
+        targets,
+        language_targets,
+        vision_targets,
+    )
 
 
 # ============================================================
-# 17. Training Dataset
+# 29. Main Runner
 # ============================================================
 
-class VQAMCDataset(Dataset):
+class SSAFYTRunner:
 
     def __init__(
         self,
-        df,
+        cfg,
+        final_mode=False,
+        tuning_plan=None,
     ):
 
-        self.df = (
-            df.reset_index(
-                drop=True
-            )
+        self.cfg = cfg
+
+        self.name = (
+            cfg["name"]
         )
 
-
-    def __len__(self):
-
-        return len(
-            self.df
+        self.model_id = (
+            cfg["model_id"]
         )
 
+        self.train_batch_size = (
+            cfg[
+                "train_batch_size"
+            ]
+        )
 
-    def __getitem__(
+        self.eval_batch_size = (
+            cfg[
+                "eval_batch_size"
+            ]
+        )
+
+        self.semantic_batch_size = (
+            cfg[
+                "semantic_batch_size"
+            ]
+        )
+
+        self.grad_accum = (
+            cfg[
+                "grad_accum"
+            ]
+        )
+
+        self.language_lr = (
+            cfg[
+                "language_lr"
+            ]
+        )
+
+        self.vision_lr = (
+            cfg[
+                "vision_lr"
+            ]
+        )
+
+        self.final_mode = (
+            final_mode
+        )
+
+        self.tuning_plan = (
+            tuning_plan
+        )
+
+        suffix = (
+            "final"
+            if final_mode
+            else "tuning"
+        )
+
+        self.save_dir = (
+            MODEL_ROOT
+            / f"ssafy_t_plus_{self.name}_{suffix}"
+        )
+
+        self.model = None
+        self.processor = None
+        self.high_processor = None
+
+        self.choice_token_tensor = None
+
+        self.yes_no_token_tensor = None
+
+        self.best_state = None
+        self.best_val_accuracy = -1.0
+
+        self.best_epoch = -1
+
+        self.best_pseudo_epoch = 0
+
+        self.best_pseudo_df = None
+
+        self.history = []
+
+
+    # ========================================================
+    # Load model
+    # ========================================================
+
+    def load(
         self,
-        idx,
     ):
 
-        row = (
-            self.df.iloc[idx]
+        print(
+            "\n"
+            + "=" * 70
         )
 
-        image = load_rgb_image(
-            row["path"]
+        print(
+            "LOAD:",
+            self.model_id,
         )
 
-        gold = (
-            str(row["answer"])
-            .strip()
-            .lower()
+        print(
+            "FINAL MODE:",
+            self.final_mode,
         )
 
-        if gold not in VALID_CHOICES:
+        print(
+            "=" * 70
+        )
 
-            raise ValueError(
-                f"Invalid answer: "
-                f"{gold}"
+        self.processor = (
+            AutoProcessor
+            .from_pretrained(
+                self.model_id,
+
+                min_pixels=(
+                    LOW_MIN_PIXELS
+                ),
+
+                max_pixels=(
+                    LOW_MAX_PIXELS
+                ),
+
+                trust_remote_code=True,
             )
+        )
+
+        self.high_processor = (
+            AutoProcessor
+            .from_pretrained(
+                self.model_id,
+
+                min_pixels=(
+                    HIGH_MIN_PIXELS
+                ),
+
+                max_pixels=(
+                    HIGH_MAX_PIXELS
+                ),
+
+                trust_remote_code=True,
+            )
+        )
+
+        for processor in [
+            self.processor,
+            self.high_processor,
+        ]:
+
+            processor.tokenizer.padding_side = (
+                "left"
+            )
+
+            if (
+                processor
+                .tokenizer
+                .pad_token_id
+                is None
+            ):
+
+                processor.tokenizer.pad_token = (
+                    processor
+                    .tokenizer
+                    .eos_token
+                )
+
+        bnb_config = (
+            BitsAndBytesConfig(
+                load_in_4bit=True,
+
+                bnb_4bit_use_double_quant=True,
+
+                bnb_4bit_quant_type="nf4",
+
+                bnb_4bit_compute_dtype=(
+                    COMPUTE_DTYPE
+                ),
+            )
+        )
+
+        base_model = (
+            Qwen3VLForConditionalGeneration
+            .from_pretrained(
+                self.model_id,
+
+                quantization_config=(
+                    bnb_config
+                ),
+
+                device_map={
+                    "": 0
+                },
+
+                trust_remote_code=True,
+
+                attn_implementation="sdpa",
+            )
+        )
+
+        base_model.config.use_cache = False
+
+        base_model = (
+            prepare_model_for_kbit_training(
+                base_model,
+
+                use_gradient_checkpointing=True,
+            )
+        )
+
+        targets, _, _ = (
+            collect_lora_targets(
+                base_model,
+
+                self.cfg[
+                    "vision_lora_blocks"
+                ],
+            )
+        )
+
+        lora_config = (
+            LoraConfig(
+                r=LORA_R,
+
+                lora_alpha=(
+                    LORA_ALPHA
+                ),
+
+                lora_dropout=(
+                    LORA_DROPOUT
+                ),
+
+                bias="none",
+
+                target_modules=(
+                    targets
+                ),
+
+                task_type=(
+                    "CAUSAL_LM"
+                ),
+            )
+        )
+
+        self.model = (
+            get_peft_model(
+                base_model,
+                lora_config,
+            )
+        )
+
+        self.model.print_trainable_parameters()
+
+        self.choice_token_tensor = (
+            self.discover_choice_tokens()
+        )
+
+        self.yes_no_token_tensor = (
+            self.discover_yes_no_tokens()
+        )
+
+
+    # ========================================================
+    # Discover a/b/c/d token IDs
+    # ========================================================
+
+    def discover_choice_tokens(
+        self,
+    ):
+
+        dummy = Image.new(
+            "RGB",
+            (28, 28),
+        )
+
+        row = {
+            "question":
+                "Choose one answer.",
+
+            "a": "A",
+            "b": "B",
+            "c": "C",
+            "d": "D",
+        }
 
         messages = (
             build_prompt_messages(
                 row,
-                image,
+                dummy,
             )
         )
 
-        weight = float(
-            row.get(
-                "sample_weight",
-                1.0,
+        prompt_text = (
+            self.processor
+            .apply_chat_template(
+                messages,
+
+                tokenize=False,
+
+                add_generation_prompt=True,
             )
         )
 
-        return {
-            "messages": messages,
-            "image": image,
-            "target": (
-                CHOICE_TO_INDEX[
-                    gold
+        prompt_ids = (
+            self.processor
+            .tokenizer(
+                prompt_text,
+
+                add_special_tokens=False,
+            )["input_ids"]
+        )
+
+        result = {}
+
+        for choice in CHOICES:
+
+            full_messages = (
+                messages
+                + [
+                    {
+                        "role":
+                            "assistant",
+
+                        "content": [
+                            {
+                                "type":
+                                    "text",
+
+                                "text":
+                                    choice,
+                            }
+                        ],
+                    }
                 ]
-            ),
-            "sample_idx": idx,
-            "sample_weight": weight,
-        }
+            )
 
-
-# ============================================================
-# 18. MC Training Collator
-#
-# 정답 token을 input에 넣지 않는다.
-#
-# assistant generation prompt 직후의
-# next-token logits를 직접 4-way 분류에 사용.
-# ============================================================
-
-@dataclass
-class MCTrainCollator:
-
-    processor: Any
-
-
-    def __call__(
-        self,
-        batch,
-    ):
-
-        texts = []
-
-        images = []
-
-        targets = []
-
-        sample_indices = []
-
-        sample_weights = []
-
-
-        for sample in batch:
-
-            text = (
+            full_text = (
                 self.processor
                 .apply_chat_template(
-                    sample[
-                        "messages"
-                    ],
+                    full_messages,
+
                     tokenize=False,
-                    add_generation_prompt=True,
+
+                    add_generation_prompt=False,
                 )
             )
 
-            texts.append(
-                text
+            full_ids = (
+                self.processor
+                .tokenizer(
+                    full_text,
+
+                    add_special_tokens=False,
+                )["input_ids"]
             )
 
-            images.append(
-                sample["image"]
-            )
+            if (
+                full_ids[
+                    :len(prompt_ids)
+                ]
+                != prompt_ids
+            ):
 
-            targets.append(
-                sample["target"]
-            )
+                raise RuntimeError(
+                    "Choice token prefix mismatch."
+                )
 
-            sample_indices.append(
-                sample["sample_idx"]
-            )
-
-            sample_weights.append(
-                sample[
-                    "sample_weight"
+            suffix = (
+                full_ids[
+                    len(prompt_ids):
                 ]
             )
 
+            result[
+                choice
+            ] = suffix[0]
 
-        enc = self.processor(
-            text=texts,
-            images=images,
-            padding=True,
-            return_tensors="pt",
-        )
+        ids = [
+            result[c]
+            for c in CHOICES
+        ]
 
+        if len(set(ids)) != 4:
 
-        enc = sanitize_inputs(
-            enc
-        )
-
-
-        enc["mc_target"] = (
-            torch.tensor(
-                targets,
-                dtype=torch.long,
+            raise RuntimeError(
+                "Choice token IDs are not unique."
             )
+
+        print(
+            "Choice token IDs:",
+            result
+        )
+
+        return torch.tensor(
+            ids,
+
+            dtype=torch.long,
+
+            device=DEVICE,
         )
 
 
-        enc["sample_idx"] = (
-            torch.tensor(
-                sample_indices,
-                dtype=torch.long,
-            )
-        )
+    # ========================================================
+    # Discover yes/no token IDs
+    # ========================================================
 
-
-        enc["sample_weight"] = (
-            torch.tensor(
-                sample_weights,
-                dtype=torch.float32,
-            )
-        )
-
-
-        return enc
-
-
-# ============================================================
-# 19. Build Loader with Surprise Replay
-# ============================================================
-
-train_ds = VQAMCDataset(
-    train_subset
-)
-
-
-surprise_scores = np.ones(
-    len(train_ds),
-    dtype=np.float32,
-)
-
-
-def build_train_loader(
-    dataset,
-    surprise=None,
-):
-
-    base_indices = list(
-        range(
-            len(dataset)
-        )
-    )
-
-
-    if (
-        USE_SURPRISE_REPLAY
-        and surprise is not None
-        and len(dataset) > 0
+    def discover_yes_no_tokens(
+        self,
     ):
 
-        extra_count = int(
-            len(dataset)
-            * SURPRISE_REPLAY_RATIO
+        dummy = Image.new(
+            "RGB",
+            (28, 28),
         )
 
-        weights = np.asarray(
-            surprise,
-            dtype=np.float64,
-        )
+        row = {
+            "question":
+                "Is the object recyclable?"
+        }
 
-        weights = np.maximum(
-            weights,
-            1e-6,
-        )
-
-
-        replay_indices = (
-            random.choices(
-                base_indices,
-                weights=weights.tolist(),
-                k=extra_count,
+        messages = (
+            build_semantic_messages(
+                row,
+                dummy,
+                "plastic",
             )
         )
 
+        prompt_text = (
+            self.processor
+            .apply_chat_template(
+                messages,
 
-        epoch_indices = (
-            base_indices
-            + replay_indices
+                tokenize=False,
+
+                add_generation_prompt=True,
+            )
         )
 
-    else:
+        prompt_ids = (
+            self.processor
+            .tokenizer(
+                prompt_text,
 
-        epoch_indices = (
-            base_indices
+                add_special_tokens=False,
+            )["input_ids"]
         )
 
+        result = {}
 
-    epoch_dataset = Subset(
-        dataset,
-        epoch_indices,
-    )
+        for word in [
+            "yes",
+            "no",
+        ]:
 
+            full = (
+                messages
+                + [
+                    {
+                        "role":
+                            "assistant",
 
-    return DataLoader(
-        epoch_dataset,
-        batch_size=TRAIN_BATCH_SIZE,
-        shuffle=True,
-        collate_fn=MCTrainCollator(
-            processor
-        ),
-        num_workers=0,
-        pin_memory=False,
-    )
+                        "content": [
+                            {
+                                "type":
+                                    "text",
 
-
-# ============================================================
-# 20. Loss function
-# ============================================================
-
-def compute_mc_losses(
-    choice_logits,
-    target,
-    sample_weight,
-):
-
-    # --------------------------------------------------------
-    # CE per sample
-    # --------------------------------------------------------
-
-    ce_per_sample = (
-        F.cross_entropy(
-            choice_logits,
-            target,
-            reduction="none",
-        )
-    )
-
-
-    # --------------------------------------------------------
-    # hardest negative margin
-    # --------------------------------------------------------
-
-    correct_logits = (
-        choice_logits
-        .gather(
-            1,
-            target.unsqueeze(1),
-        )
-        .squeeze(1)
-    )
-
-
-    wrong_mask = torch.ones_like(
-        choice_logits,
-        dtype=torch.bool,
-    )
-
-
-    wrong_mask.scatter_(
-        1,
-        target.unsqueeze(1),
-        False,
-    )
-
-
-    wrong_logits = (
-        choice_logits
-        .masked_fill(
-            ~wrong_mask,
-            float("-inf"),
-        )
-    )
-
-
-    hardest_wrong = (
-        wrong_logits.max(
-            dim=1
-        ).values
-    )
-
-
-    margin_per_sample = (
-        F.relu(
-            MARGIN
-            - correct_logits
-            + hardest_wrong
-        )
-    )
-
-
-    weighted_ce = (
-        ce_per_sample
-        * sample_weight
-    )
-
-
-    weighted_margin = (
-        margin_per_sample
-        * sample_weight
-    )
-
-
-    mc_loss = (
-        weighted_ce.mean()
-    )
-
-
-    margin_loss = (
-        weighted_margin.mean()
-    )
-
-
-    if USE_MARGIN_LOSS:
-
-        total = (
-            MC_CE_WEIGHT
-            * mc_loss
-            +
-            MARGIN_LOSS_WEIGHT
-            * margin_loss
-        )
-
-    else:
-
-        total = (
-            MC_CE_WEIGHT
-            * mc_loss
-        )
-
-
-    return (
-        total,
-        ce_per_sample,
-        mc_loss,
-        margin_loss,
-        correct_logits,
-        hardest_wrong,
-    )
-
-
-# ============================================================
-# 21. Batch prediction
-# ============================================================
-
-def predict_logits_df(
-    df,
-    batch_size,
-    processor_obj,
-    focus_pairs=None,
-    desc="Inference",
-):
-
-    model.eval()
-
-
-    all_choice_logits = []
-
-
-    for start in tqdm(
-        range(
-            0,
-            len(df),
-            batch_size,
-        ),
-        desc=desc,
-        unit="batch",
-    ):
-
-        end = min(
-            start + batch_size,
-            len(df),
-        )
-
-
-        batch_df = (
-            df.iloc[
-                start:end
-            ]
-        )
-
-
-        images = []
-
-        texts = []
-
-
-        for local_idx, (
-            _,
-            row
-        ) in enumerate(
-            batch_df.iterrows()
-        ):
-
-            global_idx = (
-                start
-                + local_idx
+                                "text":
+                                    word,
+                            }
+                        ],
+                    }
+                ]
             )
 
+            full_text = (
+                self.processor
+                .apply_chat_template(
+                    full,
 
-            image = load_rgb_image(
-                row["path"]
+                    tokenize=False,
+
+                    add_generation_prompt=False,
+                )
             )
 
+            full_ids = (
+                self.processor
+                .tokenizer(
+                    full_text,
 
-            focus = None
+                    add_special_tokens=False,
+                )["input_ids"]
+            )
 
             if (
-                focus_pairs
-                is not None
+                full_ids[
+                    :len(prompt_ids)
+                ]
+                != prompt_ids
             ):
 
-                focus = (
-                    focus_pairs[
-                        global_idx
+                raise RuntimeError(
+                    "yes/no token prefix mismatch."
+                )
+
+            suffix = (
+                full_ids[
+                    len(prompt_ids):
+                ]
+            )
+
+            result[
+                word
+            ] = suffix[0]
+
+        if (
+            result["yes"]
+            == result["no"]
+        ):
+
+            raise RuntimeError(
+                "yes/no tokens are identical."
+            )
+
+        print(
+            "Semantic token IDs:",
+            result
+        )
+
+        return torch.tensor(
+            [
+                result["yes"],
+                result["no"],
+            ],
+
+            dtype=torch.long,
+
+            device=DEVICE,
+        )
+
+
+    # ========================================================
+    # Dataset
+    # ========================================================
+
+    class DatasetImpl(
+        Dataset
+    ):
+
+        def __init__(
+            self,
+            df,
+            train_mode=True,
+        ):
+
+            self.df = (
+                df
+                .reset_index(
+                    drop=True
+                )
+            )
+
+            self.train_mode = (
+                train_mode
+            )
+
+
+        def __len__(
+            self,
+        ):
+
+            return len(
+                self.df
+            )
+
+
+        def __getitem__(
+            self,
+            idx,
+        ):
+
+            row = (
+                self.df.iloc[
+                    idx
+                ]
+            )
+
+            if (
+                self.train_mode
+                and
+                USE_TRAIN_PERMUTATION
+                and
+                random.random()
+                < TRAIN_PERMUTATION_PROB
+            ):
+
+                row_data = (
+                    permute_row(
+                        row,
+
+                        random_permutation(),
+
+                        has_answer=True,
+                    )
+                )
+
+            else:
+
+                row_data = (
+                    row.to_dict()
+                )
+
+            image = load_rgb_image(
+                row_data[
+                    "path"
+                ]
+            )
+
+            # ------------------------------------------------
+            # TRAIN-ONLY AUGMENTATION
+            # ------------------------------------------------
+
+            if self.train_mode:
+
+                image = (
+                    augment_training_image(
+                        image,
+
+                        row_data[
+                            "question"
+                        ],
+                    )
+                )
+
+            gold = (
+                str(
+                    row_data[
+                        "answer"
+                    ]
+                )
+                .strip()
+                .lower()
+            )
+
+            weight = float(
+                row_data.get(
+                    "sample_weight",
+                    1.0,
+                )
+            )
+
+            return {
+                "row":
+                    row_data,
+
+                "image":
+                    image,
+
+                "target":
+                    CHOICE_TO_INDEX[
+                        gold
+                    ],
+
+                "sample_idx":
+                    idx,
+
+                "sample_weight":
+                    weight,
+            }
+
+
+    # ========================================================
+    # Collator
+    # ========================================================
+
+    @dataclass
+    class Collator:
+
+        processor: object
+
+
+        def __call__(
+            self,
+            batch,
+        ):
+
+            texts = []
+            images = []
+
+            targets = []
+            indices = []
+            weights = []
+
+            for sample in batch:
+
+                messages = (
+                    build_prompt_messages(
+                        sample[
+                            "row"
+                        ],
+
+                        sample[
+                            "image"
+                        ],
+                    )
+                )
+
+                text = (
+                    self.processor
+                    .apply_chat_template(
+                        messages,
+
+                        tokenize=False,
+
+                        add_generation_prompt=True,
+                    )
+                )
+
+                texts.append(
+                    text
+                )
+
+                images.append(
+                    sample[
+                        "image"
                     ]
                 )
 
-
-            messages = (
-                build_prompt_messages(
-                    row,
-                    image,
-                    focus_choices=focus,
+                targets.append(
+                    sample[
+                        "target"
+                    ]
                 )
-            )
 
-
-            text = (
-                processor_obj
-                .apply_chat_template(
-                    messages,
-                    tokenize=False,
-                    add_generation_prompt=True,
+                indices.append(
+                    sample[
+                        "sample_idx"
+                    ]
                 )
-            )
 
+                weights.append(
+                    sample[
+                        "sample_weight"
+                    ]
+                )
 
-            images.append(
-                image
-            )
-
-            texts.append(
-                text
-            )
-
-
-        inputs = (
-            processor_obj(
+            enc = self.processor(
                 text=texts,
                 images=images,
                 padding=True,
                 return_tensors="pt",
             )
-        )
 
-
-        inputs = sanitize_inputs(
-            inputs
-        )
-
-
-        inputs = {
-            key: value.to(
-                DEVICE
-            )
-            for key, value
-            in inputs.items()
-        }
-
-
-        with (
-            torch.inference_mode(),
-            autocast_context()
-        ):
-
-            outputs = model(
-                **inputs,
-                use_cache=False,
-
-                # 매우 중요:
-                # vocab projection을 마지막 token에만 수행
-                logits_to_keep=1,
+            enc = sanitize_inputs(
+                enc
             )
 
-
-            last_logits = (
-                outputs.logits[
-                    :,
-                    -1,
-                    :
-                ]
-                .float()
+            enc[
+                "mc_target"
+            ] = torch.tensor(
+                targets,
+                dtype=torch.long,
             )
 
-
-            choice_logits = (
-                last_logits.index_select(
-                    dim=-1,
-                    index=(
-                        CHOICE_TOKEN_TENSOR
-                    ),
-                )
+            enc[
+                "sample_idx"
+            ] = torch.tensor(
+                indices,
+                dtype=torch.long,
             )
 
+            enc[
+                "sample_weight"
+            ] = torch.tensor(
+                weights,
+                dtype=torch.float32,
+            )
 
-        all_choice_logits.append(
-            choice_logits.cpu()
-        )
-
-
-    return torch.cat(
-        all_choice_logits,
-        dim=0,
-    )
+            return enc
 
 
-# ============================================================
-# 22. Accuracy helpers
-# ============================================================
+    # ========================================================
+    # Training loader
+    # ========================================================
 
-def gold_tensor(
-    df,
-):
-
-    return torch.tensor(
-        [
-            CHOICE_TO_INDEX[
-                str(answer)
-                .strip()
-                .lower()
-            ]
-            for answer
-            in df["answer"]
-        ],
-        dtype=torch.long,
-    )
-
-
-def accuracy_from_logits(
-    logits,
-    gold,
-):
-
-    pred = (
-        logits.argmax(
-            dim=1
-        )
-    )
-
-    accuracy = (
-        pred.eq(gold)
-        .float()
-        .mean()
-        .item()
-    )
-
-    return (
-        accuracy,
-        pred,
-    )
-
-
-def confidence_margin(
-    logits,
-):
-
-    top2 = torch.topk(
-        logits,
-        k=2,
-        dim=1,
-    ).values
-
-    return (
-        top2[:, 0]
-        - top2[:, 1]
-    )
-
-
-# ============================================================
-# 23. Optimizer creation
-# ============================================================
-
-trainable_params = [
-    param
-    for param
-    in model.parameters()
-    if param.requires_grad
-]
-
-
-def make_optimizer_scheduler(
-    lr,
-    epochs,
-    loader_length,
-):
-
-    optimizer = (
-        torch.optim.AdamW(
-            trainable_params,
-            lr=lr,
-            weight_decay=(
-                WEIGHT_DECAY
-            ),
-        )
-    )
-
-
-    steps_per_epoch = (
-        math.ceil(
-            loader_length
-            / GRAD_ACCUM
-        )
-    )
-
-
-    total_steps = (
-        max(
-            1,
-            epochs
-            * steps_per_epoch
-        )
-    )
-
-
-    warmup_steps = int(
-        total_steps
-        * WARMUP_RATIO
-    )
-
-
-    scheduler = (
-        get_linear_schedule_with_warmup(
-            optimizer,
-            num_warmup_steps=(
-                warmup_steps
-            ),
-            num_training_steps=(
-                total_steps
-            ),
-        )
-    )
-
-
-    return (
-        optimizer,
-        scheduler,
-    )
-
-
-# ============================================================
-# 24. Initial Loader / Optimizer
-# ============================================================
-
-initial_loader = (
-    build_train_loader(
-        train_ds,
-        surprise_scores,
-    )
-)
-
-
-optimizer, scheduler = (
-    make_optimizer_scheduler(
-        LR,
-        NUM_EPOCHS,
-        len(initial_loader),
-    )
-)
-
-
-scaler = torch.amp.GradScaler(
-    "cuda",
-    enabled=USE_SCALER,
-)
-
-
-# ============================================================
-# 25. Training function
-# ============================================================
-
-def train_one_epoch(
-    epoch,
-    dataset,
-    loader,
-    optimizer,
-    scheduler,
-    surprise=None,
-    desc_prefix="Stage1",
-):
-
-    model.train()
-
-    model.config.use_cache = False
-
-
-    optimizer.zero_grad(
-        set_to_none=True
-    )
-
-
-    train_loss_sum = 0.0
-
-    train_ce_sum = 0.0
-
-    train_margin_sum = 0.0
-
-
-    correct = 0
-
-    seen = 0
-
-
-    # surprise 업데이트용
-
-    surprise_accum = {}
-
-    surprise_count = {}
-
-
-    num_batches = len(
-        loader
-    )
-
-
-    progress = tqdm(
-        loader,
-        desc=(
-            f"{desc_prefix} "
-            f"Epoch {epoch}"
-        ),
-        unit="batch",
-    )
-
-
-    for step, batch in enumerate(
-        progress,
-        start=1,
+    def build_loader(
+        self,
+        dataset,
+        surprise=None,
     ):
 
-        mc_target = (
-            batch.pop(
-                "mc_target"
-            )
-            .to(DEVICE)
-        )
-
-
-        sample_idx = (
-            batch.pop(
-                "sample_idx"
+        base_indices = list(
+            range(
+                len(dataset)
             )
         )
-
-
-        sample_weight = (
-            batch.pop(
-                "sample_weight"
-            )
-            .to(DEVICE)
-        )
-
-
-        batch = sanitize_inputs(
-            batch
-        )
-
-
-        batch = {
-            key: value.to(
-                DEVICE
-            )
-            for key, value
-            in batch.items()
-        }
-
-
-        # 마지막 accumulation 그룹 보정
-
-        group_start = (
-            ((step - 1)
-             // GRAD_ACCUM)
-            * GRAD_ACCUM
-            + 1
-        )
-
-
-        accum_divisor = min(
-            GRAD_ACCUM,
-            num_batches
-            - group_start
-            + 1,
-        )
-
-
-        with autocast_context():
-
-            outputs = model(
-                **batch,
-                use_cache=False,
-                logits_to_keep=1,
-            )
-
-
-            vocab_logits = (
-                outputs.logits[
-                    :,
-                    -1,
-                    :
-                ]
-            )
-
-
-            choice_logits = (
-                vocab_logits.index_select(
-                    dim=-1,
-                    index=(
-                        CHOICE_TOKEN_TENSOR
-                    ),
-                )
-            )
-
-
-            (
-                raw_loss,
-                ce_per_sample,
-                mc_loss,
-                margin_loss,
-                _,
-                _,
-            ) = compute_mc_losses(
-                choice_logits,
-                mc_target,
-                sample_weight,
-            )
-
-
-            loss = (
-                raw_loss
-                / accum_divisor
-            )
-
-
-        if not torch.isfinite(
-            raw_loss
-        ).item():
-
-            raise RuntimeError(
-                "Non-finite loss."
-            )
-
-
-        if USE_SCALER:
-
-            scaler.scale(
-                loss
-            ).backward()
-
-        else:
-
-            loss.backward()
-
-
-        # ----------------------------------------------------
-        # train metrics
-        # ----------------------------------------------------
-
-        predictions = (
-            choice_logits
-            .detach()
-            .argmax(dim=1)
-        )
-
-
-        correct += (
-            predictions
-            .eq(mc_target)
-            .sum()
-            .item()
-        )
-
-
-        batch_size = (
-            mc_target.size(0)
-        )
-
-
-        seen += batch_size
-
-
-        train_loss_sum += (
-            raw_loss.detach()
-            .float()
-            .item()
-            * batch_size
-        )
-
-
-        train_ce_sum += (
-            mc_loss.detach()
-            .float()
-            .item()
-            * batch_size
-        )
-
-
-        train_margin_sum += (
-            margin_loss.detach()
-            .float()
-            .item()
-            * batch_size
-        )
-
-
-        # ----------------------------------------------------
-        # Surprise memory
-        # ----------------------------------------------------
 
         if (
+            USE_SURPRISE_REPLAY
+            and
             surprise is not None
         ):
 
-            ce_cpu = (
-                ce_per_sample
-                .detach()
-                .float()
-                .cpu()
-                .numpy()
+            extra_count = int(
+                len(dataset)
+                * SURPRISE_REPLAY_RATIO
             )
 
-
-            idx_cpu = (
-                sample_idx
-                .cpu()
-                .numpy()
+            weights = np.maximum(
+                np.asarray(
+                    surprise,
+                    dtype=np.float64,
+                ),
+                1e-6,
             )
 
+            replay = (
+                random.choices(
+                    base_indices,
 
-            for idx_value, loss_value in zip(
-                idx_cpu,
-                ce_cpu,
-            ):
+                    weights=(
+                        weights.tolist()
+                    ),
 
-                idx_value = int(
-                    idx_value
+                    k=extra_count,
                 )
+            )
 
-                surprise_accum[
-                    idx_value
-                ] = (
-                    surprise_accum.get(
-                        idx_value,
-                        0.0,
-                    )
-                    + float(
-                        loss_value
-                    )
+            indices = (
+                base_indices
+                + replay
+            )
+
+        else:
+
+            indices = (
+                base_indices
+            )
+
+        subset = Subset(
+            dataset,
+            indices,
+        )
+
+        return DataLoader(
+            subset,
+
+            batch_size=(
+                self.train_batch_size
+            ),
+
+            shuffle=True,
+
+            collate_fn=(
+                self.Collator(
+                    self.processor
                 )
+            ),
 
+            num_workers=0,
 
-                surprise_count[
-                    idx_value
-                ] = (
-                    surprise_count.get(
-                        idx_value,
-                        0,
-                    )
-                    + 1
-                )
-
-
-        # ----------------------------------------------------
-        # Optimizer step
-        # ----------------------------------------------------
-
-        should_step = (
-            step % GRAD_ACCUM == 0
-            or step == num_batches
+            pin_memory=False,
         )
 
 
-        if should_step:
+    # ========================================================
+    # Loss
+    # ========================================================
 
-            if USE_SCALER:
+    @staticmethod
+    def compute_loss(
+        logits,
+        target,
+        sample_weight,
+    ):
 
-                scaler.unscale_(
-                    optimizer
-                )
+        ce_sample = (
+            F.cross_entropy(
+                logits,
+                target,
+                reduction="none",
+            )
+        )
 
+        correct = (
+            logits.gather(
+                1,
+                target.unsqueeze(1),
+            )
+            .squeeze(1)
+        )
 
-            torch.nn.utils.clip_grad_norm_(
-                trainable_params,
-                MAX_GRAD_NORM,
+        mask = (
+            torch.ones_like(
+                logits,
+                dtype=torch.bool,
+            )
+        )
+
+        mask.scatter_(
+            1,
+            target.unsqueeze(1),
+            False,
+        )
+
+        hardest_wrong = (
+            logits
+            .masked_fill(
+                ~mask,
+                float("-inf"),
+            )
+            .max(dim=1)
+            .values
+        )
+
+        margin_sample = (
+            F.relu(
+                MARGIN
+                - correct
+                + hardest_wrong
+            )
+        )
+
+        ce = (
+            ce_sample
+            * sample_weight
+        ).mean()
+
+        margin_loss = (
+            margin_sample
+            * sample_weight
+        ).mean()
+
+        total = (
+            MC_CE_WEIGHT
+            * ce
+        )
+
+        if USE_MARGIN_LOSS:
+
+            total = (
+                total
+                + MARGIN_LOSS_WEIGHT
+                * margin_loss
             )
 
+        return (
+            total,
+            ce_sample,
+            ce,
+            margin_loss,
+        )
 
-            if USE_SCALER:
 
-                scaler.step(
-                    optimizer
+    # ========================================================
+    # Optimizer
+    # ========================================================
+
+    def make_optimizer(
+        self,
+        epochs,
+        loader_len,
+        pseudo=False,
+    ):
+
+        language_params = []
+        vision_params = []
+
+        for name, parameter in (
+            self.model
+            .named_parameters()
+        ):
+
+            if not parameter.requires_grad:
+
+                continue
+
+            lower = name.lower()
+
+            if (
+                "vision" in lower
+                or "visual" in lower
+            ):
+
+                vision_params.append(
+                    parameter
                 )
-
-                scaler.update()
 
             else:
 
-                optimizer.step()
-
-
-            scheduler.step()
-
-
-            optimizer.zero_grad(
-                set_to_none=True
-            )
-
-
-        progress.set_postfix(
-            loss=(
-                f"{train_loss_sum / seen:.4f}"
-            ),
-            acc=(
-                f"{correct / seen:.4f}"
-            ),
-            lr=(
-                f"{scheduler.get_last_lr()[0]:.2e}"
-            ),
-        )
-
-
-    # --------------------------------------------------------
-    # Update surprise EMA
-    # --------------------------------------------------------
-
-    if (
-        surprise is not None
-    ):
-
-        for idx_value in surprise_accum:
-
-            current = (
-                surprise_accum[
-                    idx_value
-                ]
-                /
-                surprise_count[
-                    idx_value
-                ]
-            )
-
-
-            surprise[
-                idx_value
-            ] = (
-                SURPRISE_EMA_BETA
-                * surprise[
-                    idx_value
-                ]
-                +
-                (
-                    1.0
-                    - SURPRISE_EMA_BETA
+                language_params.append(
+                    parameter
                 )
-                * current
+
+        factor = (
+            PSEUDO_LR_FACTOR
+            if pseudo
+            else 1.0
+        )
+
+        groups = []
+
+        if language_params:
+
+            groups.append(
+                {
+                    "params":
+                        language_params,
+
+                    "lr":
+                        self.language_lr
+                        * factor,
+                }
             )
 
+        if vision_params:
 
-    return {
-        "loss": (
-            train_loss_sum / seen
-        ),
-        "ce": (
-            train_ce_sum / seen
-        ),
-        "margin_loss": (
-            train_margin_sum / seen
-        ),
-        "accuracy": (
-            correct / seen
-        ),
-    }
+            groups.append(
+                {
+                    "params":
+                        vision_params,
 
+                    "lr":
+                        self.vision_lr
+                        * factor,
+                }
+            )
 
-# ============================================================
-# 26. Save adapter helper
-# ============================================================
+        optimizer = (
+            torch.optim.AdamW(
+                groups,
 
-def clone_adapter_state():
-
-    state = (
-        get_peft_model_state_dict(
-            model
-        )
-    )
-
-    return {
-        key: (
-            value.detach()
-            .cpu()
-            .clone()
-        )
-        for key, value
-        in state.items()
-    }
-
-
-# ============================================================
-# 27. Stage 1 training
-# ============================================================
-
-best_state = None
-
-best_val_accuracy = -1.0
-
-best_epoch = -1
-
-
-history = []
-
-
-for epoch in range(
-    1,
-    NUM_EPOCHS + 1,
-):
-
-    train_loader = (
-        build_train_loader(
-            train_ds,
-            surprise_scores,
-        )
-    )
-
-
-    metrics = train_one_epoch(
-        epoch=epoch,
-        dataset=train_ds,
-        loader=train_loader,
-        optimizer=optimizer,
-        scheduler=scheduler,
-        surprise=(
-            surprise_scores
-            if USE_SURPRISE_REPLAY
-            else None
-        ),
-        desc_prefix="Stage1",
-    )
-
-
-    should_eval = (
-        epoch % EVAL_EVERY == 0
-        or epoch == NUM_EPOCHS
-    )
-
-
-    val_accuracy = None
-
-
-    if should_eval:
-
-        val_logits = (
-            predict_logits_df(
-                valid_subset,
-                VALID_BATCH_SIZE,
-                processor,
-                desc=(
-                    f"Validation E{epoch}"
+                weight_decay=(
+                    WEIGHT_DECAY
                 ),
             )
         )
 
-
-        val_gold = gold_tensor(
-            valid_subset
+        steps_per_epoch = (
+            math.ceil(
+                loader_len
+                / self.grad_accum
+            )
         )
 
-
-        (
-            val_accuracy,
-            _,
-        ) = accuracy_from_logits(
-            val_logits,
-            val_gold,
+        total_steps = max(
+            1,
+            epochs
+            * steps_per_epoch,
         )
 
-
-        print(
-            f"\nEpoch {epoch}: "
-            f"val_acc="
-            f"{val_accuracy:.4f}"
+        warmup_steps = int(
+            total_steps
+            * WARMUP_RATIO
         )
 
+        scheduler = (
+            get_linear_schedule_with_warmup(
+                optimizer,
 
-        if (
-            val_accuracy
-            > best_val_accuracy
-        ):
+                num_warmup_steps=(
+                    warmup_steps
+                ),
 
-            best_val_accuracy = (
-                val_accuracy
+                num_training_steps=(
+                    total_steps
+                ),
             )
-
-            best_epoch = epoch
-
-            best_state = (
-                clone_adapter_state()
-            )
-
-
-            print(
-                "★ Best Stage1 checkpoint"
-            )
-
-
-    history.append(
-        {
-            "stage": "stage1",
-            "epoch": epoch,
-            "train_loss": metrics[
-                "loss"
-            ],
-            "train_accuracy": metrics[
-                "accuracy"
-            ],
-            "valid_accuracy": (
-                val_accuracy
-            ),
-        }
-    )
-
-
-# ============================================================
-# 28. Restore Stage1 best
-# ============================================================
-
-if best_state is None:
-
-    raise RuntimeError(
-        "Stage1 best model 없음."
-    )
-
-
-set_peft_model_state_dict(
-    model,
-    best_state,
-)
-
-
-print(
-    "\nStage1 best epoch:",
-    best_epoch
-)
-
-print(
-    "Stage1 best accuracy:",
-    best_val_accuracy
-)
-
-
-# ============================================================
-# 29. Optional DEV pseudo-label generation
-# ============================================================
-
-def human_majority(
-    row,
-):
-
-    answers = []
-
-    for col in DEV_ANSWER_COLS:
-
-        value = row[col]
-
-        if pd.isna(value):
-            continue
-
-        value = (
-            str(value)
-            .strip()
-            .lower()
         )
-
-        if value in VALID_CHOICES:
-
-            answers.append(
-                value
-            )
-
-
-    if not answers:
 
         return (
-            None,
-            0.0,
+            optimizer,
+            scheduler,
         )
 
 
-    counts = {
-        choice: answers.count(
-            choice
-        )
-        for choice
-        in CHOICES
-    }
+    # ========================================================
+    # Train one epoch
+    # ========================================================
 
-
-    max_count = max(
-        counts.values()
-    )
-
-
-    winners = [
-        choice
-        for choice, count
-        in counts.items()
-        if count == max_count
-    ]
-
-
-    # tie 제외
-
-    if len(winners) != 1:
-
-        return (
-            None,
-            0.0,
-        )
-
-
-    winner = winners[0]
-
-
-    confidence = (
-        max_count
-        / len(answers)
-    )
-
-
-    return (
-        winner,
-        confidence,
-    )
-
-
-stage1_best_state = {
-    key: value.clone()
-    for key, value
-    in best_state.items()
-}
-
-
-if USE_DEV_PSEUDO_STAGE:
-
-    print(
-        "\n===== DEV TEACHER INFERENCE ====="
-    )
-
-
-    dev_logits = (
-        predict_logits_df(
-            dev_df,
-            VALID_BATCH_SIZE,
-            processor,
-            desc="Dev teacher",
-        )
-    )
-
-
-    dev_pred_idx = (
-        dev_logits.argmax(
-            dim=1
-        )
-    )
-
-
-    dev_margin = (
-        confidence_margin(
-            dev_logits
-        )
-    )
-
-
-    pseudo_rows = []
-
-
-    for idx in range(
-        len(dev_df)
+    def train_one_epoch(
+        self,
+        epoch,
+        loader,
+        optimizer,
+        scheduler,
+        surprise,
+        stage,
     ):
 
-        row = dev_df.iloc[
-            idx
+        self.model.train()
+
+        optimizer.zero_grad(
+            set_to_none=True
+        )
+
+        scaler = (
+            torch.amp.GradScaler(
+                "cuda",
+                enabled=USE_SCALER,
+            )
+        )
+
+        seen = 0
+        correct_count = 0
+
+        loss_sum = 0.0
+
+        surprise_sum = {}
+        surprise_count = {}
+
+        num_batches = len(
+            loader
+        )
+
+        bar = tqdm(
+            loader,
+
+            desc=(
+                f"{self.name} "
+                f"{stage} E{epoch}"
+            ),
+
+            unit="batch",
+        )
+
+        for step, batch in enumerate(
+            bar,
+            start=1,
+        ):
+
+            target = (
+                batch.pop(
+                    "mc_target"
+                )
+                .to(DEVICE)
+            )
+
+            sample_idx = (
+                batch.pop(
+                    "sample_idx"
+                )
+            )
+
+            sample_weight = (
+                batch.pop(
+                    "sample_weight"
+                )
+                .to(DEVICE)
+            )
+
+            batch = sanitize_inputs(
+                batch
+            )
+
+            batch = {
+                k: v.to(DEVICE)
+                for k, v
+                in batch.items()
+            }
+
+            group_start = (
+                (
+                    (step - 1)
+                    // self.grad_accum
+                )
+                * self.grad_accum
+                + 1
+            )
+
+            divisor = min(
+                self.grad_accum,
+
+                num_batches
+                - group_start
+                + 1,
+            )
+
+            with autocast_context():
+
+                output = (
+                    self.model(
+                        **batch,
+
+                        use_cache=False,
+
+                        logits_to_keep=1,
+                    )
+                )
+
+                vocab_logits = (
+                    output.logits[
+                        :,
+                        -1,
+                        :
+                    ]
+                )
+
+                choice_logits = (
+                    vocab_logits
+                    .index_select(
+                        -1,
+
+                        self.choice_token_tensor,
+                    )
+                )
+
+                (
+                    raw_loss,
+                    ce_sample,
+                    _,
+                    _,
+                ) = self.compute_loss(
+                    choice_logits,
+                    target,
+                    sample_weight,
+                )
+
+                loss = (
+                    raw_loss
+                    / divisor
+                )
+
+            if USE_SCALER:
+
+                scaler.scale(
+                    loss
+                ).backward()
+
+            else:
+
+                loss.backward()
+
+            predictions = (
+                choice_logits
+                .detach()
+                .argmax(dim=1)
+            )
+
+            batch_size = (
+                target.size(0)
+            )
+
+            seen += batch_size
+
+            correct_count += (
+                predictions
+                .eq(target)
+                .sum()
+                .item()
+            )
+
+            loss_sum += (
+                raw_loss
+                .detach()
+                .float()
+                .item()
+                * batch_size
+            )
+
+            # ------------------------------------------------
+            # Surprise memory
+            # ------------------------------------------------
+
+            if surprise is not None:
+
+                losses = (
+                    ce_sample
+                    .detach()
+                    .float()
+                    .cpu()
+                    .numpy()
+                )
+
+                indices = (
+                    sample_idx
+                    .cpu()
+                    .numpy()
+                )
+
+                for index, value in zip(
+                    indices,
+                    losses,
+                ):
+
+                    index = int(
+                        index
+                    )
+
+                    surprise_sum[
+                        index
+                    ] = (
+                        surprise_sum.get(
+                            index,
+                            0.0,
+                        )
+                        + float(value)
+                    )
+
+                    surprise_count[
+                        index
+                    ] = (
+                        surprise_count.get(
+                            index,
+                            0,
+                        )
+                        + 1
+                    )
+
+            should_step = (
+                step
+                % self.grad_accum
+                == 0
+
+                or
+                step == num_batches
+            )
+
+            if should_step:
+
+                if USE_SCALER:
+
+                    scaler.unscale_(
+                        optimizer
+                    )
+
+                torch.nn.utils.clip_grad_norm_(
+                    [
+                        p
+                        for p
+                        in self.model.parameters()
+                        if p.requires_grad
+                    ],
+                    MAX_GRAD_NORM,
+                )
+
+                if USE_SCALER:
+
+                    scaler.step(
+                        optimizer
+                    )
+
+                    scaler.update()
+
+                else:
+
+                    optimizer.step()
+
+                scheduler.step()
+
+                optimizer.zero_grad(
+                    set_to_none=True
+                )
+
+            bar.set_postfix(
+                loss=(
+                    f"{loss_sum / seen:.4f}"
+                ),
+
+                acc=(
+                    f"{correct_count / seen:.4f}"
+                ),
+
+                lr=(
+                    f"{scheduler.get_last_lr()[0]:.1e}"
+                ),
+            )
+
+        if surprise is not None:
+
+            for index in surprise_sum:
+
+                current = (
+                    surprise_sum[index]
+                    /
+                    surprise_count[index]
+                )
+
+                surprise[
+                    index
+                ] = (
+                    SURPRISE_EMA_BETA
+                    * surprise[index]
+
+                    +
+
+                    (
+                        1
+                        - SURPRISE_EMA_BETA
+                    )
+                    * current
+                )
+
+        return {
+            "loss":
+                loss_sum / seen,
+
+            "accuracy":
+                correct_count / seen,
+        }
+
+
+    # ========================================================
+    # Letter scorer — one permutation
+    # ========================================================
+
+    def predict_permutation_logits(
+        self,
+        df,
+        permutation,
+        processor_obj,
+        focus_pairs=None,
+        desc="Inference",
+    ):
+
+        self.model.eval()
+
+        results = []
+
+        for start in tqdm(
+            range(
+                0,
+                len(df),
+                self.eval_batch_size,
+            ),
+
+            desc=desc,
+
+            unit="batch",
+        ):
+
+            end = min(
+                start
+                + self.eval_batch_size,
+                len(df),
+            )
+
+            part = (
+                df.iloc[
+                    start:end
+                ]
+            )
+
+            images = []
+            texts = []
+
+            for local_index, (
+                _,
+                row
+            ) in enumerate(
+                part.iterrows()
+            ):
+
+                row_perm = (
+                    permute_row(
+                        row,
+                        permutation,
+
+                        has_answer=(
+                            "answer"
+                            in df.columns
+                        ),
+                    )
+                )
+
+                image = load_rgb_image(
+                    row_perm[
+                        "path"
+                    ]
+                )
+
+                focus = None
+
+                if focus_pairs is not None:
+
+                    original_focus = (
+                        focus_pairs[
+                            start
+                            + local_index
+                        ]
+                    )
+
+                    converted = []
+
+                    for letter in (
+                        original_focus
+                    ):
+
+                        original_index = (
+                            CHOICE_TO_INDEX[
+                                letter
+                            ]
+                        )
+
+                        new_index = (
+                            permutation.index(
+                                original_index
+                            )
+                        )
+
+                        converted.append(
+                            CHOICES[
+                                new_index
+                            ]
+                        )
+
+                    focus = tuple(
+                        converted
+                    )
+
+                messages = (
+                    build_prompt_messages(
+                        row_perm,
+                        image,
+                        focus,
+                    )
+                )
+
+                text = (
+                    processor_obj
+                    .apply_chat_template(
+                        messages,
+
+                        tokenize=False,
+
+                        add_generation_prompt=True,
+                    )
+                )
+
+                texts.append(
+                    text
+                )
+
+                images.append(
+                    image
+                )
+
+            inputs = (
+                processor_obj(
+                    text=texts,
+                    images=images,
+                    padding=True,
+                    return_tensors="pt",
+                )
+            )
+
+            inputs = sanitize_inputs(
+                inputs
+            )
+
+            inputs = {
+                k: v.to(DEVICE)
+                for k, v
+                in inputs.items()
+            }
+
+            with (
+                torch.inference_mode(),
+                autocast_context(),
+            ):
+
+                output = self.model(
+                    **inputs,
+
+                    use_cache=False,
+
+                    logits_to_keep=1,
+                )
+
+                vocab = (
+                    output.logits[
+                        :,
+                        -1,
+                        :
+                    ]
+                    .float()
+                )
+
+                choice = (
+                    vocab.index_select(
+                        -1,
+
+                        self.choice_token_tensor,
+                    )
+                )
+
+                restored = (
+                    restore_logits_to_original_order(
+                        choice,
+                        permutation,
+                    )
+                )
+
+            results.append(
+                restored.cpu()
+            )
+
+        return torch.cat(
+            results,
+            dim=0,
+        )
+
+
+    # ========================================================
+    # Letter permutation ensemble
+    # ========================================================
+
+    def predict_letter_logp(
+        self,
+        df,
+        processor_obj=None,
+        focus_pairs=None,
+        use_permutation=True,
+        desc="Inference",
+    ):
+
+        if processor_obj is None:
+
+            processor_obj = (
+                self.processor
+            )
+
+        if (
+            use_permutation
+            and
+            USE_PERMUTATION_INFERENCE
+        ):
+
+            permutations = (
+                PERMUTATIONS
+            )
+
+        else:
+
+            permutations = [
+                PERMUTATIONS[0]
+            ]
+
+        outputs = []
+
+        for index, permutation in enumerate(
+            permutations
+        ):
+
+            logits = (
+                self.predict_permutation_logits(
+                    df,
+                    permutation,
+                    processor_obj,
+                    focus_pairs,
+
+                    desc=(
+                        f"{desc} P{index + 1}"
+                    ),
+                )
+            )
+
+            outputs.append(
+                F.log_softmax(
+                    logits,
+                    dim=1,
+                )
+            )
+
+        return (
+            torch.stack(
+                outputs,
+                dim=0,
+            )
+            .mean(dim=0)
+        )
+
+
+    # ========================================================
+    # Semantic Candidate Scorer
+    #
+    # Candidate A:
+    # image + question + actual text of option A
+    #
+    # model scores:
+    # yes / no
+    #
+    # repeated for all 4 candidates.
+    # ========================================================
+
+    def predict_semantic_logp(
+        self,
+        df,
+        desc="Semantic",
+    ):
+
+        if not USE_SEMANTIC_SCORER:
+
+            return torch.zeros(
+                (
+                    len(df),
+                    4,
+                ),
+                dtype=torch.float32,
+            )
+
+        self.model.eval()
+
+        outputs = []
+
+        for start in tqdm(
+            range(
+                0,
+                len(df),
+                self.semantic_batch_size,
+            ),
+
+            desc=desc,
+
+            unit="batch",
+        ):
+
+            end = min(
+                start
+                + self.semantic_batch_size,
+                len(df),
+            )
+
+            rows = (
+                df.iloc[
+                    start:end
+                ]
+            )
+
+            texts = []
+            images = []
+
+            for _, row in (
+                rows.iterrows()
+            ):
+
+                image = load_rgb_image(
+                    row["path"]
+                )
+
+                for choice in CHOICES:
+
+                    candidate = str(
+                        row[
+                            choice
+                        ]
+                    )
+
+                    messages = (
+                        build_semantic_messages(
+                            row,
+                            image,
+                            candidate,
+                        )
+                    )
+
+                    text = (
+                        self.processor
+                        .apply_chat_template(
+                            messages,
+
+                            tokenize=False,
+
+                            add_generation_prompt=True,
+                        )
+                    )
+
+                    texts.append(
+                        text
+                    )
+
+                    # four candidate prompts
+                    # reference same PIL image
+                    images.append(
+                        image
+                    )
+
+            inputs = (
+                self.processor(
+                    text=texts,
+                    images=images,
+                    padding=True,
+                    return_tensors="pt",
+                )
+            )
+
+            inputs = sanitize_inputs(
+                inputs
+            )
+
+            inputs = {
+                k: v.to(DEVICE)
+                for k, v
+                in inputs.items()
+            }
+
+            with (
+                torch.inference_mode(),
+                autocast_context(),
+            ):
+
+                result = (
+                    self.model(
+                        **inputs,
+
+                        use_cache=False,
+
+                        logits_to_keep=1,
+                    )
+                )
+
+                vocab_logits = (
+                    result.logits[
+                        :,
+                        -1,
+                        :
+                    ]
+                    .float()
+                )
+
+                binary_logits = (
+                    vocab_logits
+                    .index_select(
+                        -1,
+
+                        self.yes_no_token_tensor,
+                    )
+                )
+
+                binary_logp = (
+                    F.log_softmax(
+                        binary_logits,
+                        dim=1,
+                    )
+                )
+
+                # column 0 = log P(yes)
+                yes_scores = (
+                    binary_logp[
+                        :,
+                        0
+                    ]
+                )
+
+                batch_rows = (
+                    end - start
+                )
+
+                yes_scores = (
+                    yes_scores.reshape(
+                        batch_rows,
+                        4,
+                    )
+                )
+
+                # Normalize candidates against each other
+                candidate_logp = (
+                    F.log_softmax(
+                        yes_scores,
+                        dim=1,
+                    )
+                )
+
+            outputs.append(
+                candidate_logp.cpu()
+            )
+
+        return torch.cat(
+            outputs,
+            dim=0,
+        )
+
+
+    # ========================================================
+    # Metrics
+    # ========================================================
+
+    @staticmethod
+    def gold_tensor(
+        df,
+    ):
+
+        return torch.tensor(
+            [
+                CHOICE_TO_INDEX[
+                    str(answer)
+                    .strip()
+                    .lower()
+                ]
+                for answer in df[
+                    "answer"
+                ]
+            ],
+            dtype=torch.long,
+        )
+
+
+    @staticmethod
+    def accuracy(
+        logp,
+        gold,
+    ):
+
+        pred = (
+            logp.argmax(
+                dim=1
+            )
+        )
+
+        acc = (
+            pred
+            .eq(gold)
+            .float()
+            .mean()
+            .item()
+        )
+
+        return (
+            acc,
+            pred,
+        )
+
+
+    @staticmethod
+    def confidence_margin(
+        logp,
+    ):
+
+        values = (
+            torch.topk(
+                logp,
+                2,
+                dim=1,
+            )
+            .values
+        )
+
+        return (
+            values[
+                :,
+                0
+            ]
+            -
+            values[
+                :,
+                1
+            ]
+        )
+
+
+    # ========================================================
+    # Clone adapter
+    # ========================================================
+
+    def clone_state(
+        self,
+    ):
+
+        state = (
+            get_peft_model_state_dict(
+                self.model
+            )
+        )
+
+        return {
+            key:
+                value.detach()
+                .cpu()
+                .clone()
+
+            for key, value
+            in state.items()
+        }
+
+
+    # ========================================================
+    # Tune Stage 1
+    # ========================================================
+
+    def tune_stage1(
+        self,
+    ):
+
+        dataset = (
+            self.DatasetImpl(
+                train_subset,
+                train_mode=True,
+            )
+        )
+
+        surprise = np.ones(
+            len(dataset),
+            dtype=np.float32,
+        )
+
+        first_loader = (
+            self.build_loader(
+                dataset,
+                surprise,
+            )
+        )
+
+        optimizer, scheduler = (
+            self.make_optimizer(
+                NUM_EPOCHS,
+                len(first_loader),
+                pseudo=False,
+            )
+        )
+
+        for epoch in range(
+            1,
+            NUM_EPOCHS + 1,
+        ):
+
+            loader = (
+                self.build_loader(
+                    dataset,
+                    surprise,
+                )
+            )
+
+            metrics = (
+                self.train_one_epoch(
+                    epoch,
+                    loader,
+                    optimizer,
+                    scheduler,
+                    surprise,
+                    "Stage1",
+                )
+            )
+
+            val_acc = None
+
+            should_eval = (
+                epoch % EVAL_EVERY == 0
+                or
+                epoch == NUM_EPOCHS
+            )
+
+            if should_eval:
+
+                val_logp = (
+                    self.predict_letter_logp(
+                        valid_subset,
+
+                        use_permutation=True,
+
+                        desc=(
+                            f"{self.name} "
+                            f"Val E{epoch}"
+                        ),
+                    )
+                )
+
+                gold = (
+                    self.gold_tensor(
+                        valid_subset
+                    )
+                )
+
+                (
+                    val_acc,
+                    _,
+                ) = self.accuracy(
+                    val_logp,
+                    gold,
+                )
+
+                print(
+                    f"\n{self.name} "
+                    f"E{epoch} "
+                    f"val={val_acc:.5f}"
+                )
+
+                if (
+                    val_acc
+                    > self.best_val_accuracy
+                ):
+
+                    self.best_val_accuracy = (
+                        val_acc
+                    )
+
+                    self.best_epoch = (
+                        epoch
+                    )
+
+                    self.best_state = (
+                        self.clone_state()
+                    )
+
+                    print(
+                        "★ New Stage1 best"
+                    )
+
+            self.history.append(
+                {
+                    "stage":
+                        "stage1",
+
+                    "epoch":
+                        epoch,
+
+                    "train_loss":
+                        metrics["loss"],
+
+                    "train_accuracy":
+                        metrics[
+                            "accuracy"
+                        ],
+
+                    "valid_accuracy":
+                        val_acc,
+                }
+            )
+
+        if self.best_state is None:
+
+            raise RuntimeError(
+                "No best Stage1 state."
+            )
+
+        set_peft_model_state_dict(
+            self.model,
+            self.best_state,
+        )
+
+
+    # ========================================================
+    # Human majority
+    # ========================================================
+
+    @staticmethod
+    def human_majority(
+        row,
+    ):
+
+        answers = []
+
+        for column in (
+            DEV_ANSWER_COLS
+        ):
+
+            value = (
+                row[
+                    column
+                ]
+            )
+
+            if pd.isna(
+                value
+            ):
+
+                continue
+
+            value = (
+                str(value)
+                .strip()
+                .lower()
+            )
+
+            if value in VALID_CHOICES:
+
+                answers.append(
+                    value
+                )
+
+        if not answers:
+
+            return (
+                None,
+                0.0,
+            )
+
+        counts = {
+            choice:
+                answers.count(
+                    choice
+                )
+
+            for choice
+            in CHOICES
+        }
+
+        max_count = max(
+            counts.values()
+        )
+
+        winners = [
+            choice
+
+            for choice, count
+            in counts.items()
+
+            if count == max_count
         ]
 
+        if len(winners) != 1:
 
-        (
-            human_label,
-            human_conf,
-        ) = human_majority(
-            row
+            return (
+                None,
+                0.0,
+            )
+
+        return (
+            winners[0],
+
+            max_count
+            / len(answers),
         )
 
 
-        if human_label is None:
-            continue
+    # ========================================================
+    # Generate pseudo labels
+    # ========================================================
 
-
-        if (
-            human_conf
-            < PSEUDO_MIN_HUMAN_CONF
-        ):
-            continue
-
-
-        teacher_choice = (
-            CHOICES[
-                int(
-                    dev_pred_idx[
-                        idx
-                    ].item()
-                )
-            ]
-        )
-
-
-        teacher_margin = float(
-            dev_margin[
-                idx
-            ].item()
-        )
-
-
-        if (
-            teacher_choice
-            != human_label
-        ):
-            continue
-
-
-        if (
-            teacher_margin
-            < PSEUDO_MIN_TEACHER_MARGIN
-        ):
-            continue
-
-
-        record = (
-            row.to_dict()
-        )
-
-
-        record["answer"] = (
-            human_label
-        )
-
-
-        record[
-            "sample_weight"
-        ] = (
-            PSEUDO_BASE_WEIGHT
-            * human_conf
-        )
-
-
-        record[
-            "human_confidence"
-        ] = human_conf
-
-
-        record[
-            "teacher_margin"
-        ] = teacher_margin
-
-
-        pseudo_rows.append(
-            record
-        )
-
-
-    pseudo_df = pd.DataFrame(
-        pseudo_rows
-    )
-
-
-    print(
-        "Pseudo samples:",
-        len(pseudo_df)
-    )
-
-
-    SUBMISSION_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-
-    pseudo_df.to_csv(
-        PSEUDO_PATH,
-        index=False,
-    )
-
-
-# ============================================================
-# 30. Stage 2 pseudo fine-tuning
-# ============================================================
-
-if (
-    USE_DEV_PSEUDO_STAGE
-    and len(pseudo_df) > 0
-):
-
-    # --------------------------------------------
-    # Gold train + filtered pseudo
-    # validation은 포함하지 않음
-    # --------------------------------------------
-
-    gold_stage2 = (
-        train_subset.copy()
-    )
-
-
-    gold_stage2[
-        "sample_weight"
-    ] = 1.0
-
-
-    pseudo_train_cols = (
-        list(
-            gold_stage2.columns
-        )
-    )
-
-
-    pseudo_for_train = (
-        pseudo_df[
-            pseudo_train_cols
-        ].copy()
-    )
-
-
-    stage2_df = pd.concat(
-        [
-            gold_stage2,
-            pseudo_for_train,
-        ],
-        ignore_index=True,
-    )
-
-
-    stage2_ds = VQAMCDataset(
-        stage2_df
-    )
-
-
-    stage2_surprise = np.ones(
-        len(stage2_ds),
-        dtype=np.float32,
-    )
-
-
-    stage2_loader = (
-        build_train_loader(
-            stage2_ds,
-            stage2_surprise,
-        )
-    )
-
-
-    optimizer2, scheduler2 = (
-        make_optimizer_scheduler(
-            PSEUDO_LR,
-            PSEUDO_EPOCHS,
-            len(stage2_loader),
-        )
-    )
-
-
-    stage2_best_acc = (
-        best_val_accuracy
-    )
-
-
-    stage2_best_state = (
-        clone_adapter_state()
-    )
-
-
-    for pseudo_epoch in range(
-        1,
-        PSEUDO_EPOCHS + 1,
+    def generate_pseudo_df(
+        self,
     ):
 
-        stage2_loader = (
-            build_train_loader(
-                stage2_ds,
-                stage2_surprise,
-            )
-        )
+        if not USE_DEV_PSEUDO_STAGE:
 
+            return None
 
-        metrics = train_one_epoch(
-            epoch=pseudo_epoch,
-            dataset=stage2_ds,
-            loader=stage2_loader,
-            optimizer=optimizer2,
-            scheduler=scheduler2,
-            surprise=(
-                stage2_surprise
-            ),
-            desc_prefix="Stage2",
-        )
+        teacher_logp = (
+            self.predict_letter_logp(
+                dev_df,
 
+                use_permutation=False,
 
-        val_logits = (
-            predict_logits_df(
-                valid_subset,
-                VALID_BATCH_SIZE,
-                processor,
                 desc=(
-                    "Stage2 validation"
+                    f"{self.name} "
+                    "DEV teacher"
                 ),
             )
         )
 
-
-        val_gold = gold_tensor(
-            valid_subset
+        predictions = (
+            teacher_logp.argmax(
+                dim=1
+            )
         )
 
-
-        (
-            stage2_acc,
-            _,
-        ) = accuracy_from_logits(
-            val_logits,
-            val_gold,
+        margins = (
+            self.confidence_margin(
+                teacher_logp
+            )
         )
 
+        records = []
+
+        for index in range(
+            len(dev_df)
+        ):
+
+            row = (
+                dev_df.iloc[
+                    index
+                ]
+            )
+
+            (
+                human_answer,
+                human_conf,
+            ) = self.human_majority(
+                row
+            )
+
+            if human_answer is None:
+
+                continue
+
+            if (
+                human_conf
+                <
+                PSEUDO_MIN_HUMAN_CONF
+            ):
+
+                continue
+
+            teacher_answer = (
+                CHOICES[
+                    int(
+                        predictions[
+                            index
+                        ].item()
+                    )
+                ]
+            )
+
+            if (
+                teacher_answer
+                != human_answer
+            ):
+
+                continue
+
+            teacher_margin = float(
+                margins[
+                    index
+                ].item()
+            )
+
+            if (
+                teacher_margin
+                <
+                PSEUDO_MIN_TEACHER_MARGIN
+            ):
+
+                continue
+
+            record = (
+                row.to_dict()
+            )
+
+            record[
+                "answer"
+            ] = human_answer
+
+            record[
+                "sample_weight"
+            ] = (
+                PSEUDO_BASE_WEIGHT
+                * human_conf
+            )
+
+            records.append(
+                record
+            )
 
         print(
-            f"Stage2 epoch "
-            f"{pseudo_epoch}: "
-            f"{stage2_acc:.4f}"
+            self.name,
+            "pseudo count:",
+            len(records),
+        )
+
+        if not records:
+
+            return None
+
+        return pd.DataFrame(
+            records
         )
 
 
-        history.append(
-            {
-                "stage": "stage2",
-                "epoch": pseudo_epoch,
-                "train_loss": metrics[
-                    "loss"
-                ],
-                "train_accuracy": metrics[
-                    "accuracy"
-                ],
-                "valid_accuracy": (
-                    stage2_acc
-                ),
-            }
-        )
+    # ========================================================
+    # Tune pseudo Stage2
+    # ========================================================
 
+    def tune_pseudo_stage(
+        self,
+    ):
+
+        pseudo_df = (
+            self.generate_pseudo_df()
+        )
 
         if (
-            stage2_acc
-            > stage2_best_acc
+            pseudo_df is None
+            or len(pseudo_df) == 0
         ):
 
-            stage2_best_acc = (
-                stage2_acc
-            )
+            return
 
-            stage2_best_state = (
-                clone_adapter_state()
-            )
-
-
-    # --------------------------------------------
-    # Stage2가 좋아진 경우만 채택
-    # --------------------------------------------
-
-    if (
-        stage2_best_acc
-        > best_val_accuracy
-    ):
-
-        print(
-            "★ Stage2 improved model"
+        stage1_state = (
+            self.clone_state()
         )
 
-
-        best_val_accuracy = (
-            stage2_best_acc
+        gold = (
+            train_subset.copy()
         )
 
+        gold[
+            "sample_weight"
+        ] = 1.0
 
-        best_state = (
-            stage2_best_state
-        )
-
-    else:
-
-        print(
-            "Stage2 did not improve. "
-            "Restoring Stage1."
-        )
-
-
-        best_state = (
-            stage1_best_state
-        )
-
-
-# ============================================================
-# 31. Restore final best
-# ============================================================
-
-set_peft_model_state_dict(
-    model,
-    best_state,
-)
-
-
-model.eval()
-
-
-print(
-    "\nFinal best validation:",
-    best_val_accuracy
-)
-
-
-# ============================================================
-# 32. Calibrate second-pass threshold
-#
-# 1차 logits는 한 번만 계산.
-#
-# 애매한 문제만 high-resolution second pass.
-#
-# threshold 후보를 validation에서 자동 선택.
-# ============================================================
-
-def log_probabilities(
-    logits,
-):
-
-    return F.log_softmax(
-        logits,
-        dim=1,
-    )
-
-
-def calibrate_second_pass(
-    df,
-):
-
-    gold = gold_tensor(
-        df
-    )
-
-
-    first_logits = (
-        predict_logits_df(
-            df,
-            VALID_BATCH_SIZE,
-            processor,
-            desc="Pass1 calibration",
-        )
-    )
-
-
-    first_logp = (
-        log_probabilities(
-            first_logits
-        )
-    )
-
-
-    margins = (
-        confidence_margin(
-            first_logits
-        )
-    )
-
-
-    first_top2 = torch.topk(
-        first_logits,
-        k=2,
-        dim=1,
-    ).indices
-
-
-    max_threshold = max(
-        SECOND_PASS_THRESHOLDS
-    )
-
-
-    uncertain_indices = (
-        torch.where(
-            margins
-            <= max_threshold
-        )[0]
-        .tolist()
-    )
-
-
-    # second-pass logp 기본값은 pass1
-    second_logp_full = (
-        first_logp.clone()
-    )
-
-
-    if uncertain_indices:
-
-        uncertain_df = (
-            df.iloc[
-                uncertain_indices
+        pseudo_train = (
+            pseudo_df[
+                gold.columns
             ]
-            .reset_index(drop=True)
+            .copy()
         )
 
+        stage2 = pd.concat(
+            [
+                gold,
+                pseudo_train,
+            ],
+            ignore_index=True,
+        )
 
-        focus_pairs = []
+        dataset = (
+            self.DatasetImpl(
+                stage2,
+                train_mode=True,
+            )
+        )
 
+        surprise = np.ones(
+            len(dataset),
+            dtype=np.float32,
+        )
 
-        for original_idx in (
-            uncertain_indices
+        loader = (
+            self.build_loader(
+                dataset,
+                surprise,
+            )
+        )
+
+        optimizer, scheduler = (
+            self.make_optimizer(
+                PSEUDO_EPOCHS,
+                len(loader),
+                pseudo=True,
+            )
+        )
+
+        best_acc = (
+            self.best_val_accuracy
+        )
+
+        best_state = (
+            stage1_state
+        )
+
+        best_epoch = 0
+
+        for epoch in range(
+            1,
+            PSEUDO_EPOCHS + 1,
         ):
 
-            top_pair_idx = (
-                first_top2[
-                    original_idx
-                ]
-                .tolist()
-            )
-
-
-            focus_pairs.append(
-                (
-                    CHOICES[
-                        top_pair_idx[0]
-                    ],
-                    CHOICES[
-                        top_pair_idx[1]
-                    ],
+            loader = (
+                self.build_loader(
+                    dataset,
+                    surprise,
                 )
             )
 
-
-        second_logits = (
-            predict_logits_df(
-                uncertain_df,
-                VALID_BATCH_SIZE,
-                high_processor,
-                focus_pairs=(
-                    focus_pairs
-                ),
-                desc="Pass2 calibration",
-            )
-        )
-
-
-        second_logp = (
-            log_probabilities(
-                second_logits
-            )
-        )
-
-
-        for local_idx, original_idx in enumerate(
-            uncertain_indices
-        ):
-
-            second_logp_full[
-                original_idx
-            ] = second_logp[
-                local_idx
-            ]
-
-
-    best_threshold = 0.0
-
-    best_accuracy = -1.0
-
-
-    results = []
-
-
-    for threshold in (
-        SECOND_PASS_THRESHOLDS
-    ):
-
-        use_second = (
-            margins <= threshold
-        )
-
-
-        fused = (
-            first_logp.clone()
-        )
-
-
-        if use_second.any():
-
-            fused[
-                use_second
-            ] = (
-                (
-                    1.0
-                    - SECOND_PASS_WEIGHT
+            metrics = (
+                self.train_one_epoch(
+                    epoch,
+                    loader,
+                    optimizer,
+                    scheduler,
+                    surprise,
+                    "Pseudo",
                 )
-                * first_logp[
-                    use_second
-                ]
-                +
-                SECOND_PASS_WEIGHT
-                * second_logp_full[
-                    use_second
-                ]
             )
 
+            val_logp = (
+                self.predict_letter_logp(
+                    valid_subset,
+                    use_permutation=True,
 
-        (
-            acc,
-            _,
-        ) = accuracy_from_logits(
-            fused,
-            gold,
-        )
+                    desc=(
+                        f"{self.name} "
+                        f"Pseudo Val E{epoch}"
+                    ),
+                )
+            )
 
+            gold_tensor = (
+                self.gold_tensor(
+                    valid_subset
+                )
+            )
 
-        results.append(
             (
-                threshold,
                 acc,
-                int(
-                    use_second
-                    .sum()
-                    .item()
-                ),
+                _,
+            ) = self.accuracy(
+                val_logp,
+                gold_tensor,
             )
+
+            print(
+                f"{self.name} "
+                f"pseudo E{epoch}: "
+                f"{acc:.5f}"
+            )
+
+            self.history.append(
+                {
+                    "stage":
+                        "pseudo",
+
+                    "epoch":
+                        epoch,
+
+                    "train_loss":
+                        metrics["loss"],
+
+                    "train_accuracy":
+                        metrics[
+                            "accuracy"
+                        ],
+
+                    "valid_accuracy":
+                        acc,
+                }
+            )
+
+            if acc > best_acc:
+
+                best_acc = (
+                    acc
+                )
+
+                best_state = (
+                    self.clone_state()
+                )
+
+                best_epoch = (
+                    epoch
+                )
+
+        if best_epoch > 0:
+
+            self.best_val_accuracy = (
+                best_acc
+            )
+
+            self.best_state = (
+                best_state
+            )
+
+            self.best_pseudo_epoch = (
+                best_epoch
+            )
+
+            self.best_pseudo_df = (
+                pseudo_df.copy()
+            )
+
+        else:
+
+            self.best_state = (
+                stage1_state
+            )
+
+        set_peft_model_state_dict(
+            self.model,
+            self.best_state,
         )
 
 
-        print(
-            f"threshold={threshold:.2f} "
-            f"acc={acc:.4f} "
-            f"second_pass="
-            f"{int(use_second.sum())}"
+    # ========================================================
+    # Second-pass calibration
+    # ========================================================
+
+    def calibrate_second_pass(
+        self,
+        base_logp,
+    ):
+
+        if not USE_SECOND_PASS:
+
+            return 0.0
+
+        gold = (
+            self.gold_tensor(
+                valid_subset
+            )
         )
 
-
-        if acc > best_accuracy:
-
-            best_accuracy = acc
-
-            best_threshold = (
-                threshold
+        margins = (
+            self.confidence_margin(
+                base_logp
             )
+        )
 
+        max_threshold = max(
+            SECOND_PASS_THRESHOLDS
+        )
 
-    return (
-        best_threshold,
-        best_accuracy,
-        first_logits,
-        second_logp_full,
-        margins,
-        results,
-    )
+        uncertain = (
+            torch.where(
+                margins
+                <= max_threshold
+            )[0]
+            .tolist()
+        )
 
+        if not uncertain:
 
-if USE_SECOND_PASS:
+            return 0.0
 
-    (
-        best_second_threshold,
-        calibrated_accuracy,
-        _,
-        _,
-        _,
-        second_pass_results,
-    ) = calibrate_second_pass(
-        valid_subset
-    )
-
-
-    print(
-        "\nBest second-pass threshold:",
-        best_second_threshold
-    )
-
-    print(
-        "Calibrated validation accuracy:",
-        calibrated_accuracy
-    )
-
-else:
-
-    best_second_threshold = 0.0
-
-
-# ============================================================
-# 33. Final validation predictions
-# ============================================================
-
-val_first_logits = (
-    predict_logits_df(
-        valid_subset,
-        VALID_BATCH_SIZE,
-        processor,
-        desc="Final validation",
-    )
-)
-
-
-val_first_logp = (
-    log_probabilities(
-        val_first_logits
-    )
-)
-
-
-val_margins = (
-    confidence_margin(
-        val_first_logits
-    )
-)
-
-
-val_final_logp = (
-    val_first_logp.clone()
-)
-
-
-if (
-    USE_SECOND_PASS
-    and best_second_threshold > 0
-):
-
-    uncertain = torch.where(
-        val_margins
-        <= best_second_threshold
-    )[0].tolist()
-
-
-    if uncertain:
-
-        uncertain_df = (
+        subset = (
             valid_subset.iloc[
                 uncertain
             ]
             .reset_index(drop=True)
         )
 
+        top2 = (
+            torch.topk(
+                base_logp,
+                2,
+                dim=1,
+            )
+            .indices
+        )
 
-        top2 = torch.topk(
-            val_first_logits,
-            2,
-            dim=1,
-        ).indices
+        focus = []
 
-
-        focus_pairs = []
-
-
-        for idx in uncertain:
+        for index in uncertain:
 
             pair = (
                 top2[
-                    idx
+                    index
                 ].tolist()
             )
 
-            focus_pairs.append(
+            focus.append(
                 (
                     CHOICES[
                         pair[0]
@@ -3286,79 +4215,924 @@ if (
                 )
             )
 
-
-        second_logits = (
-            predict_logits_df(
-                uncertain_df,
-                VALID_BATCH_SIZE,
-                high_processor,
-                focus_pairs=(
-                    focus_pairs
-                ),
-                desc=(
-                    "Final validation "
-                    "second pass"
-                ),
-            )
-        )
-
-
         second_logp = (
-            log_probabilities(
-                second_logits
+            self.predict_letter_logp(
+                subset,
+
+                processor_obj=(
+                    self.high_processor
+                ),
+
+                focus_pairs=(
+                    focus
+                ),
+
+                use_permutation=False,
+
+                desc=(
+                    f"{self.name} "
+                    "HighRes Val"
+                ),
             )
         )
 
+        second_full = (
+            base_logp.clone()
+        )
 
-        for local_idx, idx in enumerate(
+        for local, original in enumerate(
             uncertain
         ):
 
-            val_final_logp[
-                idx
+            second_full[
+                original
+            ] = (
+                second_logp[
+                    local
+                ]
+            )
+
+        best_threshold = 0.0
+        best_accuracy = -1.0
+
+        for threshold in (
+            SECOND_PASS_THRESHOLDS
+        ):
+
+            use_second = (
+                margins
+                <= threshold
+            )
+
+            fused = (
+                base_logp.clone()
+            )
+
+            if use_second.any():
+
+                fused[
+                    use_second
+                ] = (
+                    (
+                        1
+                        - SECOND_PASS_WEIGHT
+                    )
+                    * base_logp[
+                        use_second
+                    ]
+
+                    +
+
+                    SECOND_PASS_WEIGHT
+                    * second_full[
+                        use_second
+                    ]
+                )
+
+            (
+                accuracy,
+                _,
+            ) = self.accuracy(
+                fused,
+                gold,
+            )
+
+            print(
+                self.name,
+                "threshold",
+                threshold,
+                "accuracy",
+                accuracy,
+            )
+
+            if accuracy > best_accuracy:
+
+                best_accuracy = (
+                    accuracy
+                )
+
+                best_threshold = (
+                    threshold
+                )
+
+        return best_threshold
+
+
+    # ========================================================
+    # Apply second pass
+    # ========================================================
+
+    def apply_second_pass(
+        self,
+        df,
+        base_logp,
+        threshold,
+        desc,
+    ):
+
+        if (
+            not USE_SECOND_PASS
+            or threshold <= 0
+        ):
+
+            return base_logp
+
+        margins = (
+            self.confidence_margin(
+                base_logp
+            )
+        )
+
+        uncertain = (
+            torch.where(
+                margins
+                <= threshold
+            )[0]
+            .tolist()
+        )
+
+        if not uncertain:
+
+            return base_logp
+
+        subset = (
+            df.iloc[
+                uncertain
+            ]
+            .reset_index(drop=True)
+        )
+
+        top2 = (
+            torch.topk(
+                base_logp,
+                2,
+                dim=1,
+            )
+            .indices
+        )
+
+        focus = []
+
+        for index in uncertain:
+
+            pair = (
+                top2[
+                    index
+                ].tolist()
+            )
+
+            focus.append(
+                (
+                    CHOICES[
+                        pair[0]
+                    ],
+                    CHOICES[
+                        pair[1]
+                    ],
+                )
+            )
+
+        second = (
+            self.predict_letter_logp(
+                subset,
+
+                processor_obj=(
+                    self.high_processor
+                ),
+
+                focus_pairs=focus,
+
+                use_permutation=False,
+
+                desc=desc,
+            )
+        )
+
+        final = (
+            base_logp.clone()
+        )
+
+        for local, original in enumerate(
+            uncertain
+        ):
+
+            final[
+                original
             ] = (
                 (
                     1
                     - SECOND_PASS_WEIGHT
                 )
-                * val_first_logp[
-                    idx
+                * base_logp[
+                    original
                 ]
+
                 +
+
                 SECOND_PASS_WEIGHT
-                * second_logp[
-                    local_idx
+                * second[
+                    local
                 ]
             )
 
-
-val_gold = gold_tensor(
-    valid_subset
-)
+        return final
 
 
-(
-    final_val_accuracy,
-    val_pred_idx,
-) = accuracy_from_logits(
-    val_final_logp,
-    val_gold,
-)
+    # ========================================================
+    # Semantic weight calibration
+    # ========================================================
+
+    def calibrate_semantic_weight(
+        self,
+        letter_logp,
+        semantic_logp,
+    ):
+
+        if not USE_SEMANTIC_SCORER:
+
+            return (
+                0.0,
+                letter_logp,
+            )
+
+        gold = (
+            self.gold_tensor(
+                valid_subset
+            )
+        )
+
+        best_weight = 0.0
+        best_acc = -1.0
+        best_fused = None
+
+        print(
+            f"\n===== {self.name} "
+            "SEMANTIC CALIBRATION ====="
+        )
+
+        for weight in (
+            SEMANTIC_WEIGHTS
+        ):
+
+            fused = (
+                (
+                    1.0
+                    - weight
+                )
+                * letter_logp
+
+                +
+
+                weight
+                * semantic_logp
+            )
+
+            (
+                acc,
+                _,
+            ) = self.accuracy(
+                fused,
+                gold,
+            )
+
+            print(
+                f"semantic={weight:.2f} "
+                f"acc={acc:.5f}"
+            )
+
+            if acc > best_acc:
+
+                best_acc = (
+                    acc
+                )
+
+                best_weight = (
+                    weight
+                )
+
+                best_fused = (
+                    fused.clone()
+                )
+
+        return (
+            best_weight,
+            best_fused,
+        )
 
 
-print(
-    "\n===== FINAL VALIDATION ====="
-)
+    # ========================================================
+    # Tuning phase
+    # ========================================================
 
-print(
-    "Accuracy:",
-    final_val_accuracy
-)
+    def run_tuning(
+        self,
+    ):
+
+        self.load()
+
+        self.tune_stage1()
+
+        self.tune_pseudo_stage()
+
+        if self.best_state is not None:
+
+            set_peft_model_state_dict(
+                self.model,
+                self.best_state,
+            )
+
+        self.model.eval()
+
+        gold = (
+            self.gold_tensor(
+                valid_subset
+            )
+        )
+
+        # ----------------------------------------------------
+        # identity
+        # ----------------------------------------------------
+
+        identity = (
+            self.predict_letter_logp(
+                valid_subset,
+
+                use_permutation=False,
+
+                desc=(
+                    f"{self.name} "
+                    "Identity"
+                ),
+            )
+        )
+
+        (
+            identity_acc,
+            _,
+        ) = self.accuracy(
+            identity,
+            gold,
+        )
+
+        # ----------------------------------------------------
+        # permutation
+        # ----------------------------------------------------
+
+        perm = (
+            self.predict_letter_logp(
+                valid_subset,
+
+                use_permutation=True,
+
+                desc=(
+                    f"{self.name} "
+                    "Permutation"
+                ),
+            )
+        )
+
+        (
+            perm_acc,
+            _,
+        ) = self.accuracy(
+            perm,
+            gold,
+        )
+
+        use_permutation = (
+            perm_acc
+            >= identity_acc
+        )
+
+        letter_base = (
+            perm
+            if use_permutation
+            else identity
+        )
+
+        print(
+            self.name,
+            "identity:",
+            identity_acc,
+        )
+
+        print(
+            self.name,
+            "permutation:",
+            perm_acc,
+        )
+
+        # ----------------------------------------------------
+        # second pass
+        # ----------------------------------------------------
+
+        second_threshold = (
+            self.calibrate_second_pass(
+                letter_base
+            )
+        )
+
+        letter_final = (
+            self.apply_second_pass(
+                valid_subset,
+
+                letter_base,
+
+                second_threshold,
+
+                desc=(
+                    f"{self.name} "
+                    "Final HighRes Val"
+                ),
+            )
+        )
+
+        # ----------------------------------------------------
+        # semantic scorer
+        # ----------------------------------------------------
+
+        semantic_logp = (
+            self.predict_semantic_logp(
+                valid_subset,
+
+                desc=(
+                    f"{self.name} "
+                    "Semantic Val"
+                ),
+            )
+        )
+
+        (
+            semantic_weight,
+            fused_val,
+        ) = (
+            self.calibrate_semantic_weight(
+                letter_final,
+                semantic_logp,
+            )
+        )
+
+        (
+            final_val_acc,
+            _,
+        ) = self.accuracy(
+            fused_val,
+            gold,
+        )
+
+        print(
+            f"\n===== {self.name} "
+            f"TUNING COMPLETE ====="
+        )
+
+        print(
+            "best stage1 epoch:",
+            self.best_epoch,
+        )
+
+        print(
+            "best pseudo epoch:",
+            self.best_pseudo_epoch,
+        )
+
+        print(
+            "use permutation:",
+            use_permutation,
+        )
+
+        print(
+            "second threshold:",
+            second_threshold,
+        )
+
+        print(
+            "semantic weight:",
+            semantic_weight,
+        )
+
+        print(
+            "validation:",
+            final_val_acc,
+        )
+
+        plan = {
+            "name":
+                self.name,
+
+            "best_epoch":
+                self.best_epoch,
+
+            "best_pseudo_epoch":
+                self.best_pseudo_epoch,
+
+            "pseudo_df":
+                (
+                    self.best_pseudo_df.copy()
+                    if self.best_pseudo_df
+                    is not None
+                    else None
+                ),
+
+            "use_permutation":
+                use_permutation,
+
+            "second_threshold":
+                second_threshold,
+
+            "semantic_weight":
+                semantic_weight,
+
+            "validation_logp":
+                fused_val.cpu(),
+
+            "validation_accuracy":
+                final_val_acc,
+        }
+
+        return plan
+
+
+    # ========================================================
+    # FINAL Stage1
+    #
+    # Gold 100%
+    # No validation.
+    # ========================================================
+
+    def final_gold_stage1(
+        self,
+    ):
+
+        epochs = int(
+            self.tuning_plan[
+                "best_epoch"
+            ]
+        )
+
+        print(
+            f"\n===== {self.name} "
+            "FINAL GOLD 100% ====="
+        )
+
+        print(
+            "Epochs:",
+            epochs,
+        )
+
+        dataset = (
+            self.DatasetImpl(
+                full_gold_df,
+
+                train_mode=True,
+            )
+        )
+
+        surprise = np.ones(
+            len(dataset),
+            dtype=np.float32,
+        )
+
+        loader = (
+            self.build_loader(
+                dataset,
+                surprise,
+            )
+        )
+
+        optimizer, scheduler = (
+            self.make_optimizer(
+                epochs,
+                len(loader),
+                pseudo=False,
+            )
+        )
+
+        for epoch in range(
+            1,
+            epochs + 1,
+        ):
+
+            loader = (
+                self.build_loader(
+                    dataset,
+                    surprise,
+                )
+            )
+
+            self.train_one_epoch(
+                epoch,
+                loader,
+                optimizer,
+                scheduler,
+                surprise,
+                "FINAL-GOLD",
+            )
+
+
+    # ========================================================
+    # FINAL pseudo stage
+    #
+    # Uses pseudo configuration selected during tuning.
+    # No validation.
+    # ========================================================
+
+    def final_pseudo_stage(
+        self,
+    ):
+
+        if not (
+            USE_DEV_PSEUDO_STAGE
+            and
+            FINAL_USE_SELECTED_PSEUDO_STAGE
+        ):
+
+            return
+
+        pseudo_epochs = int(
+            self.tuning_plan[
+                "best_pseudo_epoch"
+            ]
+        )
+
+        pseudo_df = (
+            self.tuning_plan[
+                "pseudo_df"
+            ]
+        )
+
+        if (
+            pseudo_epochs <= 0
+            or
+            pseudo_df is None
+            or
+            len(pseudo_df) == 0
+        ):
+
+            return
+
+        print(
+            f"\n===== {self.name} "
+            "FINAL PSEUDO ====="
+        )
+
+        print(
+            "Pseudo epochs:",
+            pseudo_epochs,
+        )
+
+        gold = (
+            full_gold_df.copy()
+        )
+
+        pseudo_train = (
+            pseudo_df[
+                gold.columns
+            ]
+            .copy()
+        )
+
+        combined = pd.concat(
+            [
+                gold,
+                pseudo_train,
+            ],
+            ignore_index=True,
+        )
+
+        dataset = (
+            self.DatasetImpl(
+                combined,
+                train_mode=True,
+            )
+        )
+
+        surprise = np.ones(
+            len(dataset),
+            dtype=np.float32,
+        )
+
+        loader = (
+            self.build_loader(
+                dataset,
+                surprise,
+            )
+        )
+
+        optimizer, scheduler = (
+            self.make_optimizer(
+                pseudo_epochs,
+                len(loader),
+                pseudo=True,
+            )
+        )
+
+        for epoch in range(
+            1,
+            pseudo_epochs + 1,
+        ):
+
+            loader = (
+                self.build_loader(
+                    dataset,
+                    surprise,
+                )
+            )
+
+            self.train_one_epoch(
+                epoch,
+                loader,
+                optimizer,
+                scheduler,
+                surprise,
+                "FINAL-PSEUDO",
+            )
+
+
+    # ========================================================
+    # FINAL test inference
+    # ========================================================
+
+    def run_final(
+        self,
+    ):
+
+        if self.tuning_plan is None:
+
+            raise RuntimeError(
+                "Final runner requires tuning_plan."
+            )
+
+        self.load()
+
+        # ====================================================
+        # 100% Gold retraining
+        # ====================================================
+
+        self.final_gold_stage1()
+
+        # ====================================================
+        # Optional selected pseudo stage
+        # ====================================================
+
+        self.final_pseudo_stage()
+
+        self.model.eval()
+
+        use_permutation = (
+            self.tuning_plan[
+                "use_permutation"
+            ]
+        )
+
+        threshold = (
+            self.tuning_plan[
+                "second_threshold"
+            ]
+        )
+
+        semantic_weight = (
+            self.tuning_plan[
+                "semantic_weight"
+            ]
+        )
+
+        # ====================================================
+        # letter score
+        # ====================================================
+
+        letter = (
+            self.predict_letter_logp(
+                test_df,
+
+                use_permutation=(
+                    use_permutation
+                ),
+
+                desc=(
+                    f"{self.name} "
+                    "FINAL Test Letter"
+                ),
+            )
+        )
+
+        letter = (
+            self.apply_second_pass(
+                test_df,
+
+                letter,
+
+                threshold,
+
+                desc=(
+                    f"{self.name} "
+                    "FINAL Test HighRes"
+                ),
+            )
+        )
+
+        # ====================================================
+        # semantic score
+        # ====================================================
+
+        if (
+            USE_SEMANTIC_SCORER
+            and
+            semantic_weight > 0
+        ):
+
+            semantic = (
+                self.predict_semantic_logp(
+                    test_df,
+
+                    desc=(
+                        f"{self.name} "
+                        "FINAL Test Semantic"
+                    ),
+                )
+            )
+
+            final_logp = (
+                (
+                    1.0
+                    - semantic_weight
+                )
+                * letter
+
+                +
+
+                semantic_weight
+                * semantic
+            )
+
+        else:
+
+            final_logp = (
+                letter
+            )
+
+        # ====================================================
+        # Save final adapter
+        # ====================================================
+
+        self.save_dir.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        self.model.save_pretrained(
+            self.save_dir
+        )
+
+        self.processor.save_pretrained(
+            self.save_dir
+        )
+
+        return (
+            final_logp.cpu()
+        )
+
+
+    # ========================================================
+    # Unload
+    # ========================================================
+
+    def unload(
+        self,
+    ):
+
+        if self.model is not None:
+
+            del self.model
+
+        if self.processor is not None:
+
+            del self.processor
+
+        if self.high_processor is not None:
+
+            del self.high_processor
+
+        self.model = None
+
+        self.processor = None
+
+        self.high_processor = None
+
+        gc.collect()
+
+        torch.cuda.empty_cache()
+
+        torch.cuda.synchronize()
 
 
 # ============================================================
-# 34. Save validation predictions
+# 30. Output folders
 # ============================================================
+
+MODEL_ROOT.mkdir(
+    parents=True,
+    exist_ok=True,
+)
 
 SUBMISSION_DIR.mkdir(
     parents=True,
@@ -3366,316 +5140,424 @@ SUBMISSION_DIR.mkdir(
 )
 
 
+# ============================================================
+# 31. PHASE A
+#
+# DEVELOPMENT / TUNING
+#
+# Gold 90%
+# Validation 10%
+#
+# Determine:
+# - best epoch
+# - pseudo stage
+# - permutation
+# - second pass threshold
+# - semantic weight
+# ============================================================
+
+tuning_plans = {}
+
+
+for cfg in MODEL_CONFIGS:
+
+    runner = (
+        SSAFYTRunner(
+            cfg,
+            final_mode=False,
+        )
+    )
+
+    plan = (
+        runner.run_tuning()
+    )
+
+    tuning_plans[
+        cfg["name"]
+    ] = plan
+
+    runner.unload()
+
+    del runner
+
+    gc.collect()
+
+    torch.cuda.empty_cache()
+
+
+# ============================================================
+# 32. Calibrate 2B / 4B ensemble
+#
+# Still development phase.
+# ============================================================
+
+val_2b = (
+    tuning_plans[
+        "2b"
+    ][
+        "validation_logp"
+    ]
+)
+
+val_4b = (
+    tuning_plans[
+        "4b"
+    ][
+        "validation_logp"
+    ]
+)
+
+validation_gold = torch.tensor(
+    [
+        CHOICE_TO_INDEX[
+            str(answer)
+            .strip()
+            .lower()
+        ]
+
+        for answer
+        in valid_subset[
+            "answer"
+        ]
+    ],
+    dtype=torch.long,
+)
+
+
+best_2b_weight = None
+best_ensemble_acc = -1.0
+best_validation_fused = None
+
+
+print(
+    "\n===== 2B/4B ENSEMBLE CALIBRATION ====="
+)
+
+
+for weight_2b in (
+    ENSEMBLE_WEIGHTS_2B
+):
+
+    weight_4b = (
+        1.0
+        - weight_2b
+    )
+
+    fused = (
+        weight_2b
+        * val_2b
+
+        +
+
+        weight_4b
+        * val_4b
+    )
+
+    prediction = (
+        fused.argmax(
+            dim=1
+        )
+    )
+
+    accuracy = (
+        prediction
+        .eq(
+            validation_gold
+        )
+        .float()
+        .mean()
+        .item()
+    )
+
+    print(
+        f"2B={weight_2b:.2f} "
+        f"4B={weight_4b:.2f} "
+        f"acc={accuracy:.5f}"
+    )
+
+    if accuracy > best_ensemble_acc:
+
+        best_ensemble_acc = (
+            accuracy
+        )
+
+        best_2b_weight = (
+            weight_2b
+        )
+
+        best_validation_fused = (
+            fused.clone()
+        )
+
+
+best_4b_weight = (
+    1.0
+    - best_2b_weight
+)
+
+
+print(
+    "\n===== DEVELOPMENT COMPLETE ====="
+)
+
+print(
+    "2B validation:",
+    tuning_plans[
+        "2b"
+    ][
+        "validation_accuracy"
+    ]
+)
+
+print(
+    "4B validation:",
+    tuning_plans[
+        "4b"
+    ][
+        "validation_accuracy"
+    ]
+)
+
+print(
+    "Ensemble validation:",
+    best_ensemble_acc,
+)
+
+print(
+    "2B weight:",
+    best_2b_weight,
+)
+
+print(
+    "4B weight:",
+    best_4b_weight,
+)
+
+
+# ============================================================
+# 33. Save validation diagnostics
+# ============================================================
+
+ensemble_val_pred = (
+    best_validation_fused
+    .argmax(dim=1)
+)
+
 validation_rows = []
 
-
-for idx in range(
+for index in range(
     len(valid_subset)
 ):
 
-    row = valid_subset.iloc[
-        idx
-    ]
-
-
     validation_rows.append(
         {
-            "id": row["id"],
-            "gold": (
+            "id":
+                valid_subset.iloc[
+                    index
+                ]["id"],
+
+            "gold":
                 str(
-                    row["answer"]
+                    valid_subset.iloc[
+                        index
+                    ]["answer"]
                 )
                 .strip()
-                .lower()
-            ),
-            "pred": (
+                .lower(),
+
+            "pred":
                 CHOICES[
                     int(
-                        val_pred_idx[
-                            idx
+                        ensemble_val_pred[
+                            index
                         ].item()
                     )
-                ]
-            ),
-            "margin": float(
-                val_margins[
-                    idx
-                ].item()
-            ),
-            "correct": (
+                ],
+
+            "correct":
                 int(
-                    val_pred_idx[
-                        idx
+                    ensemble_val_pred[
+                        index
                     ].item()
                 )
                 ==
                 int(
-                    val_gold[
-                        idx
+                    validation_gold[
+                        index
                     ].item()
-                )
-            ),
+                ),
         }
     )
-
 
 pd.DataFrame(
     validation_rows
 ).to_csv(
-    VALIDATION_PREDICTION_PATH,
+    ENSEMBLE_VALIDATION_PATH,
     index=False,
 )
 
 
 # ============================================================
-# 35. Save final model
+# IMPORTANT
+#
+# FROM THIS POINT ON:
+#
+# valid_subset is NEVER used again.
+#
+# All model architecture/hyperparameters
+# have already been fixed.
+#
+# Now:
+#
+# pretrained model
+#       ↓
+# gold 100%
+#       ↓
+# selected pseudo stage
+#       ↓
+# test
+#
 # ============================================================
-
-SAVE_DIR.mkdir(
-    parents=True,
-    exist_ok=True,
-)
-
-
-model.save_pretrained(
-    SAVE_DIR
-)
-
-
-processor.save_pretrained(
-    SAVE_DIR
-)
-
-
-pd.DataFrame(
-    history
-).to_csv(
-    SAVE_DIR
-    / "training_history.csv",
-    index=False,
-)
-
-
-print(
-    "Saved model:",
-    SAVE_DIR
-)
 
 
 # ============================================================
-# 36. TEST PASS 1
+# 34. PHASE B
+#
+# FINAL GOLD 100% RETRAINING
 # ============================================================
 
-test_first_logits = (
-    predict_logits_df(
-        test_df,
-        TEST_BATCH_SIZE,
-        processor,
-        desc="Test pass1",
-    )
-)
+final_model_test_logp = {}
 
 
-test_first_logp = (
-    log_probabilities(
-        test_first_logits
-    )
-)
+if USE_FINAL_FULL_GOLD_RETRAIN:
 
+    for cfg in MODEL_CONFIGS:
 
-test_margins = (
-    confidence_margin(
-        test_first_logits
-    )
-)
-
-
-test_final_logp = (
-    test_first_logp.clone()
-)
-
-
-used_second_pass = torch.zeros(
-    len(test_df),
-    dtype=torch.bool,
-)
-
-
-# ============================================================
-# 37. TEST PASS 2
-# ============================================================
-
-if (
-    USE_SECOND_PASS
-    and best_second_threshold > 0
-):
-
-    uncertain = torch.where(
-        test_margins
-        <= best_second_threshold
-    )[0].tolist()
-
-
-    print(
-        "Test second-pass samples:",
-        len(uncertain)
-    )
-
-
-    if uncertain:
-
-        uncertain_df = (
-            test_df.iloc[
-                uncertain
-            ]
-            .reset_index(drop=True)
+        name = (
+            cfg["name"]
         )
 
+        print(
+            "\n"
+            + "#" * 80
+        )
 
-        top2 = torch.topk(
-            test_first_logits,
-            2,
-            dim=1,
-        ).indices
+        print(
+            "FINAL 100% GOLD RETRAIN:",
+            name,
+        )
 
+        print(
+            "#" * 80
+        )
 
-        focus_pairs = []
+        runner = (
+            SSAFYTRunner(
+                cfg,
 
+                final_mode=True,
 
-        for idx in uncertain:
-
-            pair = (
-                top2[
-                    idx
-                ].tolist()
-            )
-
-
-            focus_pairs.append(
-                (
-                    CHOICES[
-                        pair[0]
-                    ],
-                    CHOICES[
-                        pair[1]
-                    ],
-                )
-            )
-
-
-        second_logits = (
-            predict_logits_df(
-                uncertain_df,
-                TEST_BATCH_SIZE,
-                high_processor,
-                focus_pairs=(
-                    focus_pairs
+                tuning_plan=(
+                    tuning_plans[
+                        name
+                    ]
                 ),
-                desc="Test pass2",
             )
         )
 
-
-        second_logp = (
-            log_probabilities(
-                second_logits
-            )
+        test_logp = (
+            runner.run_final()
         )
 
+        final_model_test_logp[
+            name
+        ] = (
+            test_logp
+        )
 
-        for local_idx, idx in enumerate(
-            uncertain
-        ):
+        runner.unload()
 
-            test_final_logp[
-                idx
-            ] = (
-                (
-                    1.0
-                    - SECOND_PASS_WEIGHT
-                )
-                * test_first_logp[
-                    idx
-                ]
-                +
-                SECOND_PASS_WEIGHT
-                * second_logp[
-                    local_idx
-                ]
-            )
+        del runner
 
+        gc.collect()
 
-            used_second_pass[
-                idx
-            ] = True
+        torch.cuda.empty_cache()
+
+else:
+
+    raise RuntimeError(
+        "This script expects "
+        "USE_FINAL_FULL_GOLD_RETRAIN=True."
+    )
 
 
 # ============================================================
-# 38. Final test prediction
+# 35. Final 2B / 4B ensemble
+#
+# Uses weight selected BEFORE full-gold retraining.
+# No validation access here.
 # ============================================================
 
-test_pred_idx = (
-    test_final_logp.argmax(
+test_2b = (
+    final_model_test_logp[
+        "2b"
+    ]
+)
+
+test_4b = (
+    final_model_test_logp[
+        "4b"
+    ]
+)
+
+final_test_logp = (
+    best_2b_weight
+    * test_2b
+
+    +
+
+    best_4b_weight
+    * test_4b
+)
+
+
+# ============================================================
+# 36. Final predictions
+# ============================================================
+
+final_prediction_idx = (
+    final_test_logp.argmax(
         dim=1
     )
 )
 
-
-preds = [
+final_predictions = [
     CHOICES[
-        int(idx)
+        int(index)
     ]
-    for idx in test_pred_idx.tolist()
+
+    for index
+    in final_prediction_idx.tolist()
 ]
 
 
 # ============================================================
-# 39. Diagnostics
+# 37. Submission
 # ============================================================
 
-print(
-    "\n===== TEST DISTRIBUTION ====="
-)
+submission = (
+    pd.DataFrame(
+        {
+            "id":
+                test_df[
+                    "id"
+                ],
 
-
-print(
-    pd.Series(
-        preds
+            "answer":
+                final_predictions,
+        }
     )
-    .value_counts()
-    .sort_index()
 )
-
-
-print(
-    "\n===== TEST RATIO ====="
-)
-
-
-print(
-    pd.Series(
-        preds
-    )
-    .value_counts(
-        normalize=True
-    )
-    .sort_index()
-)
-
-
-# ============================================================
-# 40. Submission
-# ============================================================
-
-submission = pd.DataFrame(
-    {
-        "id": test_df[
-            "id"
-        ],
-        "answer": preds,
-    }
-)
-
 
 if (
     len(submission)
@@ -3683,9 +5565,8 @@ if (
 ):
 
     raise RuntimeError(
-        "Submission row mismatch."
+        "Submission length mismatch."
     )
-
 
 if not set(
     submission[
@@ -3696,112 +5577,222 @@ if not set(
 ):
 
     raise RuntimeError(
-        "Invalid submission answer."
+        "Invalid prediction detected."
     )
 
-
 submission.to_csv(
-    SUBMISSION_PATH,
+    FINAL_SUBMISSION_PATH,
     index=False,
 )
 
 
 # ============================================================
-# 41. Save logits / diagnostics
+# 38. Save diagnostics
 # ============================================================
 
 logit_rows = []
 
-
-for idx in range(
+for index in range(
     len(test_df)
 ):
 
     logit_rows.append(
         {
-            "id": (
+            "id":
                 test_df.iloc[
-                    idx
-                ]["id"]
-            ),
+                    index
+                ]["id"],
 
-            "pred": preds[
-                idx
-            ],
+            "answer":
+                final_predictions[
+                    index
+                ],
 
-            "margin_pass1": float(
-                test_margins[
-                    idx
-                ].item()
-            ),
+            "score_a":
+                float(
+                    final_test_logp[
+                        index,
+                        0
+                    ].item()
+                ),
 
-            "used_second_pass": bool(
-                used_second_pass[
-                    idx
-                ].item()
-            ),
+            "score_b":
+                float(
+                    final_test_logp[
+                        index,
+                        1
+                    ].item()
+                ),
 
-            "score_a": float(
-                test_final_logp[
-                    idx,
-                    0
-                ].item()
-            ),
+            "score_c":
+                float(
+                    final_test_logp[
+                        index,
+                        2
+                    ].item()
+                ),
 
-            "score_b": float(
-                test_final_logp[
-                    idx,
-                    1
-                ].item()
-            ),
+            "score_d":
+                float(
+                    final_test_logp[
+                        index,
+                        3
+                    ].item()
+                ),
 
-            "score_c": float(
-                test_final_logp[
-                    idx,
-                    2
-                ].item()
-            ),
+            "pred_2b":
+                CHOICES[
+                    int(
+                        test_2b[
+                            index
+                        ]
+                        .argmax()
+                        .item()
+                    )
+                ],
 
-            "score_d": float(
-                test_final_logp[
-                    idx,
-                    3
-                ].item()
-            ),
+            "pred_4b":
+                CHOICES[
+                    int(
+                        test_4b[
+                            index
+                        ]
+                        .argmax()
+                        .item()
+                    )
+                ],
         }
     )
-
 
 pd.DataFrame(
     logit_rows
 ).to_csv(
-    TEST_LOGIT_PATH,
+    FINAL_LOGIT_PATH,
     index=False,
 )
 
 
+# ============================================================
+# 39. Final report
+# ============================================================
+
 print(
-    "\n===== DONE ====="
+    "\n===== SSAFY-T+ COMPLETE ====="
 )
 
 print(
-    "Validation accuracy:",
-    final_val_accuracy
+    "\nDevelopment validation:"
 )
 
 print(
-    "Second-pass threshold:",
-    best_second_threshold
+    "2B:",
+    tuning_plans[
+        "2b"
+    ][
+        "validation_accuracy"
+    ],
 )
 
 print(
-    "Submission:",
-    SUBMISSION_PATH
+    "4B:",
+    tuning_plans[
+        "4b"
+    ][
+        "validation_accuracy"
+    ],
 )
 
 print(
-    "Logits:",
-    TEST_LOGIT_PATH
+    "2B/4B ensemble:",
+    best_ensemble_acc,
+)
+
+print(
+    "\nSelected 2B settings:"
+)
+
+print(
+    tuning_plans[
+        "2b"
+    ]
+)
+
+print(
+    "\nSelected 4B settings:"
+)
+
+print(
+    tuning_plans[
+        "4b"
+    ]
+)
+
+print(
+    "\nEnsemble weights:"
+)
+
+print(
+    "2B:",
+    best_2b_weight,
+)
+
+print(
+    "4B:",
+    best_4b_weight,
+)
+
+print(
+    "\nTest distribution:"
+)
+
+print(
+    pd.Series(
+        final_predictions
+    )
+    .value_counts()
+    .sort_index()
+)
+
+print(
+    "\nTest ratio:"
+)
+
+print(
+    pd.Series(
+        final_predictions
+    )
+    .value_counts(
+        normalize=True
+    )
+    .sort_index()
+)
+
+print(
+    "\nSubmission:"
+)
+
+print(
+    FINAL_SUBMISSION_PATH
+)
+
+print(
+    "\nLogits:"
+)
+
+print(
+    FINAL_LOGIT_PATH
+)
+
+print(
+    "\nValidation diagnostics:"
+)
+
+print(
+    ENSEMBLE_VALIDATION_PATH
+)
+
+print(
+    "\nPreview:"
 )
 
 print(
