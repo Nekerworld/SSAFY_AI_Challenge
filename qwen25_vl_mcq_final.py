@@ -1,58 +1,100 @@
 # ============================================================
-# SSAFY-8B Simple Baseline
+# SSAFY-Agent v0
 #
-# Purpose
-# ------------------------------------------------------------
-# 복잡한 SSAFY-T / SSAFY-T+ 기능을 모두 제거하고,
-# Qwen3-VL-8B 자체의 순수 backbone 성능을 확인하기 위한 baseline.
+# InternVL3.5-4B + Rule Router + YOLO Visual Tools
 #
-# Architecture
 # ------------------------------------------------------------
-# - Qwen3-VL-8B-Instruct
+# MAIN MODEL
+# ------------------------------------------------------------
+# - OpenGVLab/InternVL3_5-4B
 # - 4-bit NF4 QLoRA
-# - LoRA r=16 / alpha=32
 # - Language LoRA only
-# - Gold train only
-# - 90% train / 10% fixed validation
+# - r=16 / alpha=32
+# - LR=1e-4
 # - 1 epoch
-# - LR = 1e-4
-# - assistant answer token only CE loss
-# - direct a/b/c/d next-token logit inference
+# - Gold train 90% / validation 10%
 #
-# NOT USED
 # ------------------------------------------------------------
-# - Surprise Replay
-# - Margin Loss
-# - Vision LoRA
-# - DEV pseudo labels
-# - Augmentation
-# - Option permutation
-# - Semantic scorer
-# - Second pass
-# - Ensemble
+# TOOLS — inference only
+# ------------------------------------------------------------
+# 1. General YOLO
+#    - object
+#    - bbox
+#    - count
+#    - position
+#
+# 2. Recycling Material YOLO
+#    - plastic
+#    - glass
+#    - metal
+#    - paper
+#    - etc.
+#
+# 3. Crop / Zoom
+#    - YOLO bbox 확대
+#
+# 4. Rule Router
+#    - question type
+#    - InternVL confidence
+#
+# ------------------------------------------------------------
+# PIPELINE
+# ------------------------------------------------------------
+#
+# Image + Question
+#        ↓
+# InternVL First Pass
+#        ↓
+# confidence + question
+#        ↓
+# Rule Router
+#        ↓
+# YOLO tools (if needed)
+#        ↓
+# structured evidence + crop
+#        ↓
+# InternVL Second Pass
+#        ↓
+# a / b / c / d
+#
 # ============================================================
 
 
 # ============================================================
-# 0. Imports
+# 0. Required packages
+# ============================================================
+#
+# pip install -U transformers accelerate bitsandbytes peft
+# pip install -U ultralytics huggingface_hub
+# pip install -U scikit-learn pandas pillow tqdm
+#
 # ============================================================
 
+
+import gc
 import math
 import random
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
+
 from PIL import Image
 
 import torch
-from torch.utils.data import Dataset, DataLoader
 
-from sklearn.model_selection import train_test_split
+from torch.utils.data import (
+    Dataset,
+    DataLoader,
+)
+
+from sklearn.model_selection import (
+    train_test_split,
+)
 
 from transformers import (
-    Qwen3VLForConditionalGeneration,
+    AutoModelForImageTextToText,
     AutoProcessor,
     BitsAndBytesConfig,
     get_linear_schedule_with_warmup,
@@ -64,39 +106,39 @@ from peft import (
     prepare_model_for_kbit_training,
 )
 
+from ultralytics import YOLO
+
+from huggingface_hub import (
+    hf_hub_download,
+    list_repo_files,
+)
+
 from tqdm.auto import tqdm
 
 
 # ============================================================
-# 1. Project / Config
+# 1. Project
 # ============================================================
 
 try:
     PROJECT_DIR = Path(__file__).resolve().parent
+
 except NameError:
     PROJECT_DIR = Path.cwd().resolve()
 
 
-MODEL_ID = "Qwen/Qwen3-VL-8B-Instruct"
+# ============================================================
+# 2. Core config
+# ============================================================
 
 SEED = 42
 
-
-# ------------------------------------------------------------
-# Image resolution
-#
-# 3090 Ti 24GB 기준으로 보수적인 설정.
-# 성능 테스트 후 MAX_PIXELS를 512 * 28 * 28까지
-# 올려볼 수 있음.
-# ------------------------------------------------------------
-
-MIN_PIXELS = 256 * 28 * 28
-MAX_PIXELS = 448 * 28 * 28
+MODEL_ID = "OpenGVLab/InternVL3_5-4B"
 
 
-# ------------------------------------------------------------
-# Training
-# ------------------------------------------------------------
+# ============================================================
+# 3. Training config
+# ============================================================
 
 NUM_EPOCHS = 1
 
@@ -110,71 +152,153 @@ MAX_GRAD_NORM = 1.0
 
 
 # ------------------------------------------------------------
-# RTX 3090 Ti 24GB
-#
-# 먼저 batch=2 권장.
-#
-# OOM 발생:
-# TRAIN_BATCH_SIZE = 1
-# GRAD_ACCUM = 16
-#
-# 로 변경.
+# 3090 Ti 24GB
 # ------------------------------------------------------------
 
 TRAIN_BATCH_SIZE = 2
+
 GRAD_ACCUM = 8
-
-
-# ------------------------------------------------------------
-# Validation / Test
-# ------------------------------------------------------------
 
 EVAL_BATCH_SIZE = 4
 
 
-# ------------------------------------------------------------
-# LoRA
-#
-# Discussion 조건
-# ------------------------------------------------------------
+# ============================================================
+# 4. LoRA
+# ============================================================
 
 LORA_R = 16
+
 LORA_ALPHA = 32
+
 LORA_DROPOUT = 0.05
 
 
 # ============================================================
-# 2. Paths
+# 5. Tool config
+# ============================================================
+
+USE_GENERAL_YOLO = True
+
+USE_MATERIAL_YOLO = True
+
+USE_CROP_TOOL = True
+
+
+# ------------------------------------------------------------
+# General YOLO
+#
+# 최초 실행 시 Ultralytics weight 다운로드 가능.
+# 추론 자체는 로컬 GPU에서 수행.
+# ------------------------------------------------------------
+
+GENERAL_YOLO_MODEL = "yolov8l.pt"
+
+GENERAL_YOLO_CONF = 0.25
+
+GENERAL_YOLO_IMGSZ = 640
+
+
+# ------------------------------------------------------------
+# Material YOLO
+#
+# Hugging Face의 공개 recycling/material YOLO 저장소.
+#
+# repo 내 .pt checkpoint를 자동 탐색한다.
+#
+# 저장소를 다른 recycling YOLO로 교체해도 됨.
+# ------------------------------------------------------------
+
+MATERIAL_YOLO_REPO = (
+    "CatSat/yolov11-litter-materials"
+)
+
+MATERIAL_YOLO_CONF = 0.20
+
+MATERIAL_YOLO_IMGSZ = 640
+
+
+# ------------------------------------------------------------
+# Router
+#
+# first-pass top1 - top2 logit margin
+#
+# 낮으면 tool을 사용.
+# ------------------------------------------------------------
+
+ROUTER_MARGIN_THRESHOLD = 0.80
+
+
+# ------------------------------------------------------------
+# validation에서 threshold 탐색할 후보
+# ------------------------------------------------------------
+
+CALIBRATE_ROUTER_THRESHOLD = True
+
+ROUTER_THRESHOLD_CANDIDATES = [
+    0.0,
+    0.25,
+    0.50,
+    0.75,
+    1.00,
+    1.50,
+    2.00,
+]
+
+
+# ------------------------------------------------------------
+# Crop
+#
+# bbox 주변을 조금 넓혀 자른다.
+# ------------------------------------------------------------
+
+CROP_PADDING_RATIO = 0.12
+
+MAX_CROPS_PER_SAMPLE = 2
+
+
+# ============================================================
+# 6. Paths
 # ============================================================
 
 TRAIN_CSV = PROJECT_DIR / "train.csv"
-DEV_CSV = PROJECT_DIR / "dev.csv"
+
 TEST_CSV = PROJECT_DIR / "test.csv"
+
 
 SAVE_DIR = (
     PROJECT_DIR
     / "model"
-    / "qwen3_vl_8b_simple"
+    / "internvl3_5_4b_agent"
 )
+
 
 SUBMISSION_DIR = (
     PROJECT_DIR
     / "submission"
 )
 
+
 SUBMISSION_PATH = (
     SUBMISSION_DIR
-    / "submission_8b_simple.csv"
+    / "submission_internvl_agent.csv"
 )
+
+
+BASELINE_SUBMISSION_PATH = (
+    SUBMISSION_DIR
+    / "submission_internvl_baseline.csv"
+)
+
 
 VALIDATION_PATH = (
     SUBMISSION_DIR
-    / "validation_8b_simple.csv"
+    / "internvl_agent_validation.csv"
 )
 
-LOGIT_PATH = (
+
+TOOL_LOG_PATH = (
     SUBMISSION_DIR
-    / "logits_8b_simple.csv"
+    / "internvl_agent_tool_log.csv"
 )
 
 
@@ -182,44 +306,62 @@ Image.MAX_IMAGE_PIXELS = None
 
 
 # ============================================================
-# 3. Reproducibility / CUDA
+# 7. Reproducibility / CUDA
 # ============================================================
 
 random.seed(SEED)
+
 torch.manual_seed(SEED)
 
+
 if not torch.cuda.is_available():
+
     raise RuntimeError(
         "CUDA GPU가 필요합니다."
     )
 
-torch.cuda.manual_seed_all(SEED)
 
-DEVICE = torch.device("cuda:0")
-
-BF16_SUPPORTED = (
-    torch.cuda.is_bf16_supported()
+torch.cuda.manual_seed_all(
+    SEED
 )
+
+
+DEVICE = torch.device(
+    "cuda:0"
+)
+
 
 COMPUTE_DTYPE = (
     torch.bfloat16
-    if BF16_SUPPORTED
+    if torch.cuda.is_bf16_supported()
     else torch.float16
 )
 
+
 USE_SCALER = (
-    COMPUTE_DTYPE == torch.float16
+    COMPUTE_DTYPE
+    == torch.float16
 )
 
 
-print("Project       :", PROJECT_DIR)
-print("GPU           :", torch.cuda.get_device_name(0))
-print("Compute dtype :", COMPUTE_DTYPE)
-print("GradScaler    :", USE_SCALER)
+print(
+    "Project:",
+    PROJECT_DIR
+)
+
+print(
+    "GPU:",
+    torch.cuda.get_device_name(0)
+)
+
+print(
+    "dtype:",
+    COMPUTE_DTYPE
+)
 
 
 # ============================================================
-# 4. Helpers
+# 8. Choices
 # ============================================================
 
 CHOICES = (
@@ -229,60 +371,55 @@ CHOICES = (
     "d",
 )
 
+
+CHOICE_TO_INDEX = {
+    c: i
+    for i, c
+    in enumerate(CHOICES)
+}
+
+
 VALID_CHOICES = set(
     CHOICES
 )
 
 
-def resolve_image_path(path_value):
+# ============================================================
+# 9. Image helpers
+# ============================================================
+
+def resolve_image_path(
+    value,
+):
 
     path = Path(
-        str(path_value)
+        str(value)
     )
 
     if not path.is_absolute():
-        path = PROJECT_DIR / path
+
+        path = (
+            PROJECT_DIR
+            / path
+        )
 
     return path
 
 
-def load_rgb_image(path_value):
-
-    path = resolve_image_path(
-        path_value
-    )
-
-    with Image.open(path) as image:
-        return image.convert("RGB")
-
-
-def validate_image_paths(
-    df,
-    name,
+def load_rgb_image(
+    value,
 ):
 
-    missing = []
+    path = resolve_image_path(
+        value
+    )
 
-    for value in df["path"]:
+    with Image.open(
+        path
+    ) as image:
 
-        path = resolve_image_path(
-            value
-        )
-
-        if not path.exists():
-
-            missing.append(
-                str(path)
-            )
-
-            if len(missing) >= 10:
-                break
-
-    if missing:
-
-        raise FileNotFoundError(
-            f"{name} 이미지 누락:\n"
-            + "\n".join(missing)
+        return image.convert(
+            "RGB"
         )
 
 
@@ -294,9 +431,10 @@ def autocast_context():
     )
 
 
-def sanitize_inputs(inputs):
+def sanitize_inputs(
+    inputs,
+):
 
-    # 일부 processor 환경에서 생성될 수 있음.
     inputs.pop(
         "token_type_ids",
         None,
@@ -306,12 +444,13 @@ def sanitize_inputs(inputs):
 
 
 # ============================================================
-# 5. Load Data
+# 10. Dataset
 # ============================================================
 
 train_df = pd.read_csv(
     TRAIN_CSV
 )
+
 
 test_df = pd.read_csv(
     TEST_CSV
@@ -328,6 +467,7 @@ TRAIN_REQUIRED = {
     "d",
     "answer",
 }
+
 
 TEST_REQUIRED = {
     "id",
@@ -354,7 +494,7 @@ def require_columns(
     if missing:
 
         raise ValueError(
-            f"{name} missing columns: "
+            f"{name}: missing "
             f"{sorted(missing)}"
         )
 
@@ -365,6 +505,7 @@ require_columns(
     "train.csv",
 )
 
+
 require_columns(
     test_df,
     TEST_REQUIRED,
@@ -372,47 +513,8 @@ require_columns(
 )
 
 
-# ------------------------------------------------------------
-# Answer validation
-# ------------------------------------------------------------
-
-answers = (
-    train_df["answer"]
-    .astype(str)
-    .str.strip()
-    .str.lower()
-)
-
-if not set(
-    answers.unique()
-).issubset(
-    VALID_CHOICES
-):
-
-    raise ValueError(
-        "train answer에 "
-        "a/b/c/d 이외 값이 존재합니다."
-    )
-
-
-validate_image_paths(
-    train_df,
-    "train"
-)
-
-validate_image_paths(
-    test_df,
-    "test"
-)
-
-
 # ============================================================
-# 6. Fixed 90 / 10 Split
-#
-# 5,073개라면 대략
-#
-# train      ≈ 4,565
-# validation ≈   508
+# 11. Split
 # ============================================================
 
 train_subset, valid_subset = (
@@ -423,9 +525,9 @@ train_subset, valid_subset = (
 
         random_state=SEED,
 
-        stratify=(
-            train_df["answer"]
-        ),
+        stratify=train_df[
+            "answer"
+        ],
     )
 )
 
@@ -435,10 +537,12 @@ train_subset = (
     .reset_index(drop=True)
 )
 
+
 valid_subset = (
     valid_subset
     .reset_index(drop=True)
 )
+
 
 test_df = (
     test_df
@@ -446,60 +550,38 @@ test_df = (
 )
 
 
-print("\n===== DATA =====")
-
 print(
-    "Total train :",
-    len(train_df)
+    "\n===== DATA ====="
 )
 
 print(
-    "Train       :",
+    "Train:",
     len(train_subset)
 )
 
 print(
-    "Validation  :",
+    "Valid:",
     len(valid_subset)
 )
 
 print(
-    "Test        :",
+    "Test:",
     len(test_df)
 )
 
 
-print(
-    "\nTrain label distribution:"
-)
-
-print(
-    train_subset[
-        "answer"
-    ]
-    .value_counts()
-    .sort_index()
-)
-
-
 # ============================================================
-# 7. Processor
+# 12. InternVL Processor
 # ============================================================
 
 processor = (
     AutoProcessor.from_pretrained(
         MODEL_ID,
 
-        min_pixels=MIN_PIXELS,
-
-        max_pixels=MAX_PIXELS,
-
         trust_remote_code=True,
     )
 )
 
-
-# inference batching을 위해 left padding
 
 processor.tokenizer.padding_side = (
     "left"
@@ -516,14 +598,8 @@ if (
     )
 
 
-print(
-    "\nPadding side:",
-    processor.tokenizer.padding_side
-)
-
-
 # ============================================================
-# 8. 4-bit NF4 Model
+# 13. InternVL 4-bit model
 # ============================================================
 
 bnb_config = (
@@ -542,8 +618,8 @@ bnb_config = (
 )
 
 
-base_model = (
-    Qwen3VLForConditionalGeneration
+model = (
+    AutoModelForImageTextToText
     .from_pretrained(
 
         MODEL_ID,
@@ -557,25 +633,17 @@ base_model = (
         },
 
         trust_remote_code=True,
-
-        # Windows에서 flash-attn 설치가 번거로우므로
-        # PyTorch SDPA 사용.
-        attn_implementation="sdpa",
     )
 )
 
 
-base_model.config.use_cache = False
+model.config.use_cache = False
 
 
-# ============================================================
-# 9. Prepare QLoRA
-# ============================================================
-
-base_model = (
+model = (
     prepare_model_for_kbit_training(
 
-        base_model,
+        model,
 
         use_gradient_checkpointing=True,
     )
@@ -583,22 +651,19 @@ base_model = (
 
 
 # ============================================================
-# 10. Language-only LoRA
-#
-# Discussion baseline을 단순하게 재현하기 위해
-# Vision LoRA는 사용하지 않음.
+# 14. Language-only LoRA
 # ============================================================
 
-LLM_TARGET_SUFFIXES = (
+TARGET_SUFFIXES = (
 
-    "self_attn.q_proj",
-    "self_attn.k_proj",
-    "self_attn.v_proj",
-    "self_attn.o_proj",
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
 
-    "mlp.gate_proj",
-    "mlp.up_proj",
-    "mlp.down_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj",
 )
 
 
@@ -606,83 +671,95 @@ target_modules = []
 
 
 for name, module in (
-    base_model.named_modules()
+    model.named_modules()
 ):
 
-    lower_name = (
+    lower = (
         name.lower()
     )
 
-    # Vision tower 제외
+
+    # vision 계층 제외
     if (
-        "vision" in lower_name
+        "vision" in lower
         or
-        "visual" in lower_name
+        "visual" in lower
+        or
+        "intern_vit" in lower
     ):
+
         continue
 
+
     if any(
-        name.endswith(suffix)
+        name.endswith(
+            suffix
+        )
+
         for suffix
-        in LLM_TARGET_SUFFIXES
+        in TARGET_SUFFIXES
     ):
 
-        target_modules.append(
-            name
-        )
+        # Linear 계열만
+        if (
+            "linear"
+            in module.__class__
+            .__name__
+            .lower()
+        ):
+
+            target_modules.append(
+                name
+            )
 
 
 target_modules = sorted(
-    set(target_modules)
+    set(
+        target_modules
+    )
 )
 
 
 if not target_modules:
 
     raise RuntimeError(
-        "LoRA target module을 "
+        "Language LoRA target을 "
         "찾지 못했습니다."
     )
 
 
 print(
-    "\n===== LoRA ====="
-)
-
-print(
-    "Target modules:",
+    "\nLoRA targets:",
     len(target_modules)
 )
 
-print(
-    "r:",
-    LORA_R
-)
 
-print(
-    "alpha:",
-    LORA_ALPHA
-)
+lora_config = (
+    LoraConfig(
 
+        r=LORA_R,
 
-lora_config = LoraConfig(
+        lora_alpha=(
+            LORA_ALPHA
+        ),
 
-    r=LORA_R,
+        lora_dropout=(
+            LORA_DROPOUT
+        ),
 
-    lora_alpha=LORA_ALPHA,
+        bias="none",
 
-    lora_dropout=LORA_DROPOUT,
+        target_modules=(
+            target_modules
+        ),
 
-    bias="none",
-
-    target_modules=target_modules,
-
-    task_type="CAUSAL_LM",
+        task_type="CAUSAL_LM",
+    )
 )
 
 
 model = get_peft_model(
-    base_model,
+    model,
     lora_config,
 )
 
@@ -691,115 +768,110 @@ model.print_trainable_parameters()
 
 
 # ============================================================
-# 11. Prompt
+# 15. Prompts
 # ============================================================
 
 SYSTEM_INSTRUCT = (
     "You are a visual multiple-choice "
     "question answering assistant. "
-    "Inspect the image and question carefully. "
-    "Answer using exactly one lowercase letter: "
+    "Inspect the image carefully and answer "
+    "using exactly one lowercase letter: "
     "a, b, c, or d. "
-    "Do not provide any explanation."
+    "Do not explain."
 )
 
 
-def build_mc_prompt(
-    question,
-    a,
-    b,
-    c,
-    d,
+def build_question_text(
+    row,
 ):
 
     return (
-        f"{question}\n\n"
-        f"(a) {a}\n"
-        f"(b) {b}\n"
-        f"(c) {c}\n"
-        f"(d) {d}\n\n"
-        "정답을 a, b, c, d 중 하나의 "
-        "소문자 한 글자로만 출력하세요."
+        f"{row['question']}\n\n"
+        f"(a) {row['a']}\n"
+        f"(b) {row['b']}\n"
+        f"(c) {row['c']}\n"
+        f"(d) {row['d']}\n\n"
+        "Return exactly one lowercase letter: "
+        "a, b, c, or d."
     )
 
 
-def build_prompt_messages(
+def build_messages(
     row,
-    image,
+    images,
+    extra_context=None,
 ):
 
-    user_text = build_mc_prompt(
+    content = []
 
-        str(
-            row["question"]
-        ),
 
-        str(
-            row["a"]
-        ),
+    # 원본 + crop 모두 이미지로 전달
+    for image in images:
 
-        str(
-            row["b"]
-        ),
+        content.append(
+            {
+                "type": "image",
+                "image": image,
+            }
+        )
 
-        str(
-            row["c"]
-        ),
 
-        str(
-            row["d"]
-        ),
+    text = build_question_text(
+        row
+    )
+
+
+    if extra_context:
+
+        text = (
+            "External visual tools produced "
+            "the following observations.\n\n"
+
+            + extra_context
+
+            + "\n\n"
+            "The tool outputs may contain errors. "
+            "Use them only as supporting evidence. "
+            "Inspect the image yourself and make "
+            "the final decision.\n\n"
+
+            + text
+        )
+
+
+    content.append(
+        {
+            "type": "text",
+            "text": text,
+        }
     )
 
 
     return [
-
         {
-            "role":
-                "system",
-
+            "role": "system",
             "content": [
                 {
-                    "type":
-                        "text",
-
-                    "text":
-                        SYSTEM_INSTRUCT,
+                    "type": "text",
+                    "text": SYSTEM_INSTRUCT,
                 }
             ],
         },
 
         {
-            "role":
-                "user",
-
-            "content": [
-
-                {
-                    "type":
-                        "image",
-
-                    "image":
-                        image,
-                },
-
-                {
-                    "type":
-                        "text",
-
-                    "text":
-                        user_text,
-                },
-            ],
+            "role": "user",
+            "content": content,
         },
     ]
 
 
 # ============================================================
-# 12. Dataset
+# 16. Training Dataset
 # ============================================================
 
-class VQADataset(Dataset):
+class InternDataset(
+    Dataset
+):
 
     def __init__(
         self,
@@ -848,35 +920,22 @@ class VQADataset(Dataset):
         )
 
 
-        if gold not in VALID_CHOICES:
-
-            raise ValueError(
-                f"Invalid answer: {gold}"
-            )
-
-
-        prompt_messages = (
-            build_prompt_messages(
-                row,
-                image,
-            )
+        messages = build_messages(
+            row,
+            [image],
         )
 
 
         full_messages = (
-            prompt_messages
+            messages
             + [
                 {
-                    "role":
-                        "assistant",
+                    "role": "assistant",
 
                     "content": [
                         {
-                            "type":
-                                "text",
-
-                            "text":
-                                gold,
+                            "type": "text",
+                            "text": gold,
                         }
                     ],
                 }
@@ -885,24 +944,14 @@ class VQADataset(Dataset):
 
 
         return {
-
-            "image":
-                image,
-
-            "prompt_messages":
-                prompt_messages,
-
-            "full_messages":
-                full_messages,
+            "image": image,
+            "messages": messages,
+            "full_messages": full_messages,
         }
 
 
 # ============================================================
-# 13. Assistant-only Loss Collator
-#
-# loss는 정답 a/b/c/d 한 글자에만 적용.
-#
-# prompt/system/question/options에는 loss 없음.
+# 17. Collator
 # ============================================================
 
 @dataclass
@@ -917,9 +966,7 @@ class TrainCollator:
     ):
 
         images = [
-            sample[
-                "image"
-            ]
+            sample["image"]
             for sample
             in batch
         ]
@@ -932,12 +979,12 @@ class TrainCollator:
 
         for sample in batch:
 
-            prompt_text = (
+            prompt_texts.append(
                 self.processor
                 .apply_chat_template(
 
                     sample[
-                        "prompt_messages"
+                        "messages"
                     ],
 
                     tokenize=False,
@@ -947,7 +994,7 @@ class TrainCollator:
             )
 
 
-            full_text = (
+            full_texts.append(
                 self.processor
                 .apply_chat_template(
 
@@ -962,19 +1009,6 @@ class TrainCollator:
             )
 
 
-            prompt_texts.append(
-                prompt_text
-            )
-
-            full_texts.append(
-                full_text
-            )
-
-
-        # ----------------------------------------------------
-        # Full sequence
-        # ----------------------------------------------------
-
         full_enc = self.processor(
 
             text=full_texts,
@@ -986,10 +1020,6 @@ class TrainCollator:
             return_tensors="pt",
         )
 
-
-        # ----------------------------------------------------
-        # Prompt-only sequence
-        # ----------------------------------------------------
 
         prompt_enc = self.processor(
 
@@ -1007,14 +1037,11 @@ class TrainCollator:
             full_enc
         )
 
+
         prompt_enc = sanitize_inputs(
             prompt_enc
         )
 
-
-        # ----------------------------------------------------
-        # labels = -100 everywhere
-        # ----------------------------------------------------
 
         labels = torch.full_like(
 
@@ -1022,64 +1049,52 @@ class TrainCollator:
                 "input_ids"
             ],
 
-            fill_value=-100,
+            -100,
         )
 
-
-        # ----------------------------------------------------
-        # 정답 첫 token만 supervision
-        # ----------------------------------------------------
 
         for i in range(
             len(batch)
         ):
 
-            full_positions = (
-
+            full_pos = (
                 full_enc[
                     "attention_mask"
                 ][i]
-
                 .nonzero(
                     as_tuple=False
                 )
-
                 .squeeze(-1)
             )
 
 
-            prompt_positions = (
-
+            prompt_pos = (
                 prompt_enc[
                     "attention_mask"
                 ][i]
-
                 .nonzero(
                     as_tuple=False
                 )
-
                 .squeeze(-1)
             )
 
 
             full_ids = (
-
                 full_enc[
                     "input_ids"
                 ][
                     i,
-                    full_positions
+                    full_pos
                 ]
             )
 
 
             prompt_ids = (
-
                 prompt_enc[
                     "input_ids"
                 ][
                     i,
-                    prompt_positions
+                    prompt_pos
                 ]
             )
 
@@ -1088,20 +1103,6 @@ class TrainCollator:
                 prompt_ids.numel()
             )
 
-
-            full_len = int(
-                full_ids.numel()
-            )
-
-
-            if prompt_len >= full_len:
-
-                raise RuntimeError(
-                    "Prompt/full length error."
-                )
-
-
-            # 실제 prefix인지 확인
 
             if not torch.equal(
 
@@ -1113,33 +1114,26 @@ class TrainCollator:
             ):
 
                 raise RuntimeError(
-                    "Prompt/full token prefix mismatch."
+                    "Prompt/full prefix mismatch."
                 )
 
 
-            answer_positions = (
-
-                full_positions[
-                    prompt_len:
+            answer_pos = (
+                full_pos[
+                    prompt_len
                 ]
-            )
-
-
-            answer_position = (
-                answer_positions[0]
             )
 
 
             labels[
                 i,
-                answer_position
+                answer_pos
             ] = (
-
                 full_enc[
                     "input_ids"
                 ][
                     i,
-                    answer_position
+                    answer_pos
                 ]
             )
 
@@ -1153,17 +1147,14 @@ class TrainCollator:
 
 
 # ============================================================
-# 14. DataLoader
+# 18. Train Loader
 # ============================================================
-
-train_ds = VQADataset(
-    train_subset
-)
-
 
 train_loader = DataLoader(
 
-    train_ds,
+    InternDataset(
+        train_subset
+    ),
 
     batch_size=(
         TRAIN_BATCH_SIZE
@@ -1178,124 +1169,43 @@ train_loader = DataLoader(
     ),
 
     num_workers=0,
-
-    pin_memory=False,
-)
-
-
-print(
-    "\nTrain batches:",
-    len(train_loader)
 )
 
 
 # ============================================================
-# 15. Label sanity check
+# 19. Discover a/b/c/d tokens
 # ============================================================
 
-debug_batch = next(
-    iter(train_loader)
-)
+def discover_choice_tokens():
 
-
-debug_labels = (
-    debug_batch[
-        "labels"
-    ][0]
-)
-
-
-target_ids = (
-    debug_labels[
-        debug_labels != -100
-    ]
-)
-
-
-target_text = (
-    processor.tokenizer.decode(
-
-        target_ids,
-
-        skip_special_tokens=False,
-    )
-)
-
-
-print(
-    "\n===== LABEL CHECK ====="
-)
-
-print(
-    repr(
-        target_text
-    )
-)
-
-print(
-    "=======================\n"
-)
-
-
-if not any(
-    choice
-    in target_text.lower()
-
-    for choice
-    in CHOICES
-):
-
-    raise RuntimeError(
-        "Answer-token masking failed."
-    )
-
-
-# ============================================================
-# 16. Discover actual a/b/c/d token IDs
-# ============================================================
-
-def discover_choice_token_ids():
-
-    dummy_image = Image.new(
+    dummy = Image.new(
         "RGB",
-        (28, 28),
+        (448, 448),
     )
 
 
-    dummy_row = {
-
+    row = {
         "question":
-            "Choose the correct option.",
+            "Choose the correct answer.",
 
-        "a":
-            "A",
-
-        "b":
-            "B",
-
-        "c":
-            "C",
-
-        "d":
-            "D",
+        "a": "one",
+        "b": "two",
+        "c": "three",
+        "d": "four",
     }
 
 
-    prompt_messages = (
-        build_prompt_messages(
-
-            dummy_row,
-
-            dummy_image,
-        )
+    messages = build_messages(
+        row,
+        [dummy],
     )
 
 
-    prompt_text = (
+    prompt = (
         processor
         .apply_chat_template(
 
-            prompt_messages,
+            messages,
 
             tokenize=False,
 
@@ -1307,7 +1217,7 @@ def discover_choice_token_ids():
     prompt_ids = (
         processor.tokenizer(
 
-            prompt_text,
+            prompt,
 
             add_special_tokens=False,
         )[
@@ -1321,21 +1231,16 @@ def discover_choice_token_ids():
 
     for choice in CHOICES:
 
-        full_messages = (
-
-            prompt_messages
+        full = (
+            messages
             + [
                 {
-                    "role":
-                        "assistant",
+                    "role": "assistant",
 
                     "content": [
                         {
-                            "type":
-                                "text",
-
-                            "text":
-                                choice,
+                            "type": "text",
+                            "text": choice,
                         }
                     ],
                 }
@@ -1347,7 +1252,7 @@ def discover_choice_token_ids():
             processor
             .apply_chat_template(
 
-                full_messages,
+                full,
 
                 tokenize=False,
 
@@ -1376,7 +1281,7 @@ def discover_choice_token_ids():
         ):
 
             raise RuntimeError(
-                f"Choice token prefix mismatch: {choice}"
+                "Choice token prefix mismatch."
             )
 
 
@@ -1387,24 +1292,9 @@ def discover_choice_token_ids():
         )
 
 
-        if not suffix:
-
-            raise RuntimeError(
-                f"No token for choice={choice}"
-            )
-
-
         result[
             choice
         ] = suffix[0]
-
-
-        print(
-            f"{choice}: "
-            f"id={suffix[0]}, "
-            f"decoded="
-            f"{processor.tokenizer.decode([suffix[0]])!r}"
-        )
 
 
     if (
@@ -1417,7 +1307,7 @@ def discover_choice_token_ids():
     ):
 
         raise RuntimeError(
-            "a/b/c/d first token IDs are not unique."
+            "Choice token IDs not unique."
         )
 
 
@@ -1425,7 +1315,7 @@ def discover_choice_token_ids():
 
 
 choice_token_ids = (
-    discover_choice_token_ids()
+    discover_choice_tokens()
 )
 
 
@@ -1433,11 +1323,8 @@ CHOICE_TOKEN_TENSOR = (
     torch.tensor(
 
         [
-            choice_token_ids[
-                choice
-            ]
-            for choice
-            in CHOICES
+            choice_token_ids[c]
+            for c in CHOICES
         ],
 
         dtype=torch.long,
@@ -1447,25 +1334,31 @@ CHOICE_TOKEN_TENSOR = (
 )
 
 
+print(
+    "Choice tokens:",
+    choice_token_ids
+)
+
+
 # ============================================================
-# 17. Optimizer / Scheduler
+# 20. Optimizer
 # ============================================================
 
-trainable_params = [
+trainable_parameters = [
 
-    parameter
+    p
 
-    for parameter
+    for p
     in model.parameters()
 
-    if parameter.requires_grad
+    if p.requires_grad
 ]
 
 
 optimizer = (
     torch.optim.AdamW(
 
-        trainable_params,
+        trainable_parameters,
 
         lr=LR,
 
@@ -1487,18 +1380,14 @@ steps_per_epoch = (
 
 
 total_steps = (
-
     NUM_EPOCHS
-    *
-    steps_per_epoch
+    * steps_per_epoch
 )
 
 
 warmup_steps = int(
-
     total_steps
-    *
-    WARMUP_RATIO
+    * WARMUP_RATIO
 )
 
 
@@ -1507,13 +1396,9 @@ scheduler = (
 
         optimizer,
 
-        num_warmup_steps=(
-            warmup_steps
-        ),
+        warmup_steps,
 
-        num_training_steps=(
-            total_steps
-        ),
+        total_steps,
     )
 )
 
@@ -1528,29 +1413,8 @@ scaler = (
 )
 
 
-print(
-    "\n===== OPTIMIZER ====="
-)
-
-print(
-    "Effective batch:",
-    TRAIN_BATCH_SIZE
-    * GRAD_ACCUM
-)
-
-print(
-    "Optimizer steps:",
-    total_steps
-)
-
-print(
-    "Warmup steps:",
-    warmup_steps
-)
-
-
 # ============================================================
-# 18. Training
+# 21. Train InternVL
 # ============================================================
 
 optimizer.zero_grad(
@@ -1564,36 +1428,21 @@ for epoch in range(
 
     model.train()
 
-    model.config.use_cache = False
 
+    total_loss = 0.0
 
-    running_loss = 0.0
-
-    batch_count = 0
-
-
-    num_batches = len(
-        train_loader
-    )
+    count = 0
 
 
     bar = tqdm(
-
         train_loader,
-
-        desc=(
-            f"Epoch "
-            f"{epoch + 1}/"
-            f"{NUM_EPOCHS}"
-        ),
-
-        unit="batch",
+        desc="InternVL training",
     )
 
 
     for step, batch in enumerate(
         bar,
-        start=1,
+        1,
     ):
 
         batch = sanitize_inputs(
@@ -1602,73 +1451,30 @@ for epoch in range(
 
 
         batch = {
+            k: v.to(DEVICE)
 
-            key:
-                value.to(
-                    DEVICE
-                )
-
-            for key, value
+            for k, v
             in batch.items()
         }
 
 
-        # ----------------------------------------------------
-        # Last incomplete accumulation group correction
-        # ----------------------------------------------------
-
-        group_start = (
-
-            (
-                (step - 1)
-                // GRAD_ACCUM
-            )
-
-            * GRAD_ACCUM
-
-            + 1
-        )
-
-
-        accum_divisor = min(
-
-            GRAD_ACCUM,
-
-            num_batches
-            - group_start
-            + 1,
-        )
-
-
         with autocast_context():
 
-            outputs = model(
-
+            out = model(
                 **batch,
-
                 use_cache=False,
             )
 
 
             raw_loss = (
-                outputs.loss
+                out.loss
             )
 
 
             loss = (
                 raw_loss
                 /
-                accum_divisor
-            )
-
-
-        if not torch.isfinite(
-            raw_loss
-        ).item():
-
-            raise RuntimeError(
-                f"Non-finite loss: "
-                f"{raw_loss.item()}"
+                GRAD_ACCUM
             )
 
 
@@ -1683,32 +1489,22 @@ for epoch in range(
             loss.backward()
 
 
-        running_loss += (
-
+        total_loss += float(
             raw_loss
             .detach()
             .float()
-            .item()
         )
 
 
-        batch_count += 1
+        count += 1
 
 
-        should_step = (
-
-            step
-            % GRAD_ACCUM
-            == 0
-
-            or
-
-            step
-            == num_batches
-        )
-
-
-        if should_step:
+        if (
+            step % GRAD_ACCUM == 0
+            or step == len(
+                train_loader
+            )
+        ):
 
             if USE_SCALER:
 
@@ -1718,9 +1514,7 @@ for epoch in range(
 
 
             torch.nn.utils.clip_grad_norm_(
-
-                trainable_params,
-
+                trainable_parameters,
                 MAX_GRAD_NORM,
             )
 
@@ -1746,352 +1540,15 @@ for epoch in range(
             )
 
 
-        avg_loss = (
-
-            running_loss
-            /
-            batch_count
-        )
-
-
         bar.set_postfix(
-
             loss=(
-                f"{avg_loss:.4f}"
-            ),
-
-            lr=(
-                f"{scheduler.get_last_lr()[0]:.2e}"
-            ),
-        )
-
-
-train_loss = (
-
-    running_loss
-    /
-    max(
-        batch_count,
-        1
-    )
-)
-
-
-print(
-    "\n===== TRAIN COMPLETE ====="
-)
-
-print(
-    "Train loss:",
-    train_loss
-)
-
-
-# ============================================================
-# 19. Batched direct MC inference
-# ============================================================
-
-def predict_logits(
-    df,
-    desc,
-):
-
-    model.eval()
-
-
-    all_logits = []
-
-
-    for start in tqdm(
-
-        range(
-            0,
-            len(df),
-            EVAL_BATCH_SIZE,
-        ),
-
-        desc=desc,
-
-        unit="batch",
-    ):
-
-        end = min(
-
-            start
-            + EVAL_BATCH_SIZE,
-
-            len(df),
-        )
-
-
-        part = df.iloc[
-            start:end
-        ]
-
-
-        texts = []
-
-        images = []
-
-
-        for _, row in (
-            part.iterrows()
-        ):
-
-            image = load_rgb_image(
-                row["path"]
-            )
-
-
-            messages = (
-                build_prompt_messages(
-                    row,
-                    image,
-                )
-            )
-
-
-            text = (
-                processor
-                .apply_chat_template(
-
-                    messages,
-
-                    tokenize=False,
-
-                    add_generation_prompt=True,
-                )
-            )
-
-
-            texts.append(
-                text
-            )
-
-
-            images.append(
-                image
-            )
-
-
-        inputs = (
-            processor(
-
-                text=texts,
-
-                images=images,
-
-                padding=True,
-
-                return_tensors="pt",
+                f"{total_loss / count:.4f}"
             )
         )
 
 
-        inputs = sanitize_inputs(
-            inputs
-        )
-
-
-        inputs = {
-
-            key:
-                value.to(
-                    DEVICE
-                )
-
-            for key, value
-            in inputs.items()
-        }
-
-
-        with (
-            torch.inference_mode(),
-            autocast_context(),
-        ):
-
-            outputs = model(
-
-                **inputs,
-
-                use_cache=False,
-
-                # 마지막 token position만 vocabulary projection
-                logits_to_keep=1,
-            )
-
-
-            vocab_logits = (
-
-                outputs.logits[
-                    :,
-                    -1,
-                    :
-                ]
-
-                .float()
-            )
-
-
-            choice_logits = (
-
-                vocab_logits
-                .index_select(
-
-                    dim=-1,
-
-                    index=(
-                        CHOICE_TOKEN_TENSOR
-                    ),
-                )
-            )
-
-
-        all_logits.append(
-            choice_logits.cpu()
-        )
-
-
-    return torch.cat(
-        all_logits,
-        dim=0,
-    )
-
-
 # ============================================================
-# 20. Validation
-# ============================================================
-
-validation_logits = (
-    predict_logits(
-
-        valid_subset,
-
-        desc="Validation",
-    )
-)
-
-
-validation_pred_idx = (
-
-    validation_logits
-    .argmax(
-        dim=1
-    )
-)
-
-
-validation_predictions = [
-
-    CHOICES[
-        int(index)
-    ]
-
-    for index
-    in validation_pred_idx.tolist()
-]
-
-
-validation_gold = [
-
-    str(answer)
-    .strip()
-    .lower()
-
-    for answer
-    in valid_subset[
-        "answer"
-    ]
-]
-
-
-correct = sum(
-
-    pred == gold
-
-    for pred, gold
-    in zip(
-
-        validation_predictions,
-
-        validation_gold,
-    )
-)
-
-
-validation_accuracy = (
-
-    correct
-    /
-    len(valid_subset)
-)
-
-
-print(
-    "\n===== VALIDATION ====="
-)
-
-print(
-    f"Accuracy: "
-    f"{validation_accuracy:.5f}"
-)
-
-print(
-    f"Correct : "
-    f"{correct}/"
-    f"{len(valid_subset)}"
-)
-
-
-# ============================================================
-# 21. Save validation predictions
-# ============================================================
-
-SUBMISSION_DIR.mkdir(
-    parents=True,
-    exist_ok=True,
-)
-
-
-validation_output = (
-    pd.DataFrame(
-        {
-            "id":
-                valid_subset[
-                    "id"
-                ],
-
-            "gold":
-                validation_gold,
-
-            "pred":
-                validation_predictions,
-
-            "correct":
-                [
-                    p == g
-
-                    for p, g
-                    in zip(
-                        validation_predictions,
-                        validation_gold,
-                    )
-                ],
-        }
-    )
-)
-
-
-validation_output.to_csv(
-
-    VALIDATION_PATH,
-
-    index=False,
-)
-
-
-# ============================================================
-# 22. Save LoRA Adapter
+# 22. Save InternVL adapter
 # ============================================================
 
 SAVE_DIR.mkdir(
@@ -2110,85 +1567,1740 @@ processor.save_pretrained(
 )
 
 
-print(
-    "\nSaved model:",
-    SAVE_DIR
-)
+# ============================================================
+# 23. First-pass InternVL
+# ============================================================
+
+def internvl_predict(
+    row,
+    images,
+    extra_context=None,
+):
+
+    model.eval()
+
+
+    messages = build_messages(
+
+        row,
+
+        images,
+
+        extra_context=(
+            extra_context
+        ),
+    )
+
+
+    text = (
+        processor
+        .apply_chat_template(
+
+            messages,
+
+            tokenize=False,
+
+            add_generation_prompt=True,
+        )
+    )
+
+
+    inputs = processor(
+
+        text=[text],
+
+        images=images,
+
+        return_tensors="pt",
+    )
+
+
+    inputs = sanitize_inputs(
+        inputs
+    )
+
+
+    inputs = {
+        k: v.to(DEVICE)
+
+        for k, v
+        in inputs.items()
+    }
+
+
+    with (
+        torch.inference_mode(),
+        autocast_context(),
+    ):
+
+        out = model(
+            **inputs,
+            use_cache=False,
+        )
+
+
+        logits = (
+            out.logits[
+                0,
+                -1,
+            ]
+            .float()
+        )
+
+
+        choice_logits = (
+            logits
+            .index_select(
+                0,
+                CHOICE_TOKEN_TENSOR,
+            )
+        )
+
+
+    top2 = torch.topk(
+        choice_logits,
+        2,
+    )
+
+
+    pred_index = int(
+        top2.indices[0]
+    )
+
+
+    margin = float(
+        top2.values[0]
+        - top2.values[1]
+    )
+
+
+    return {
+        "pred":
+            CHOICES[
+                pred_index
+            ],
+
+        "margin":
+            margin,
+
+        "logits":
+            choice_logits
+            .cpu(),
+    }
 
 
 # ============================================================
-# 23. Test inference
+# 24. Rule Router
 # ============================================================
 
-test_logits = (
-    predict_logits(
+OBJECT_KEYWORDS = [
 
-        test_df,
+    "몇 개",
+    "몇개",
+    "개수",
+    "수량",
 
-        desc="Test",
-    )
-)
+    "왼쪽",
+    "오른쪽",
+    "중앙",
+    "가운데",
 
+    "위",
+    "아래",
 
-test_pred_idx = (
+    "어디",
+    "위치",
 
-    test_logits
-    .argmax(
-        dim=1
-    )
-)
+    "보이는",
+    "들어 있는",
 
-
-test_predictions = [
-
-    CHOICES[
-        int(index)
-    ]
-
-    for index
-    in test_pred_idx.tolist()
+    "병",
+    "캔",
+    "컵",
+    "용기",
 ]
 
 
-# ============================================================
-# 24. Prediction diagnostics
-# ============================================================
+MATERIAL_KEYWORDS = [
 
-print(
-    "\n===== TEST DISTRIBUTION ====="
-)
+    "재질",
+    "소재",
+
+    "플라스틱",
+    "비닐",
+    "유리",
+    "금속",
+    "종이",
+    "캔",
+
+    "plastic",
+    "glass",
+    "metal",
+    "paper",
+]
 
 
-print(
-    pd.Series(
-        test_predictions
+def route_tools(
+    question,
+    margin,
+    threshold,
+):
+
+    q = str(
+        question
+    ).lower()
+
+
+    object_match = any(
+        keyword in q
+
+        for keyword
+        in OBJECT_KEYWORDS
     )
-    .value_counts()
-    .sort_index()
+
+
+    material_match = any(
+        keyword in q
+
+        for keyword
+        in MATERIAL_KEYWORDS
+    )
+
+
+    low_confidence = (
+        margin
+        <= threshold
+    )
+
+
+    tools = []
+
+
+    if (
+        USE_GENERAL_YOLO
+        and
+        (
+            object_match
+            or
+            low_confidence
+        )
+    ):
+
+        tools.append(
+            "general_yolo"
+        )
+
+
+    if (
+        USE_MATERIAL_YOLO
+        and
+        (
+            material_match
+            or
+            low_confidence
+        )
+    ):
+
+        tools.append(
+            "material_yolo"
+        )
+
+
+    if (
+        USE_CROP_TOOL
+        and tools
+    ):
+
+        tools.append(
+            "crop"
+        )
+
+
+    return tools
+
+
+# ============================================================
+# 25. Load YOLO tools
+# ============================================================
+
+general_yolo = None
+
+material_yolo = None
+
+
+if USE_GENERAL_YOLO:
+
+    print(
+        "\nLoading General YOLO..."
+    )
+
+    general_yolo = YOLO(
+        GENERAL_YOLO_MODEL
+    )
+
+
+# ============================================================
+# Material checkpoint automatic discovery
+# ============================================================
+
+def find_hf_yolo_checkpoint(
+    repo_id,
+):
+
+    files = list_repo_files(
+        repo_id
+    )
+
+
+    pt_files = [
+        name
+        for name in files
+        if name.lower().endswith(
+            ".pt"
+        )
+    ]
+
+
+    if not pt_files:
+
+        raise RuntimeError(
+            f"No .pt YOLO checkpoint "
+            f"found in {repo_id}"
+        )
+
+
+    # best.pt 우선
+    preferred = [
+
+        name
+
+        for name
+        in pt_files
+
+        if Path(
+            name
+        ).name.lower()
+        == "best.pt"
+    ]
+
+
+    filename = (
+        preferred[0]
+        if preferred
+        else pt_files[0]
+    )
+
+
+    print(
+        "Material YOLO checkpoint:",
+        filename
+    )
+
+
+    return hf_hub_download(
+
+        repo_id=repo_id,
+
+        filename=filename,
+    )
+
+
+if USE_MATERIAL_YOLO:
+
+    print(
+        "\nLoading Material YOLO..."
+    )
+
+
+    material_checkpoint = (
+        find_hf_yolo_checkpoint(
+            MATERIAL_YOLO_REPO
+        )
+    )
+
+
+    material_yolo = YOLO(
+        material_checkpoint
+    )
+
+
+# ============================================================
+# 26. YOLO result helpers
+# ============================================================
+
+def box_position(
+    bbox,
+    width,
+    height,
+):
+
+    x1, y1, x2, y2 = bbox
+
+
+    cx = (
+        x1 + x2
+    ) / 2
+
+
+    cy = (
+        y1 + y2
+    ) / 2
+
+
+    horizontal = (
+        "left"
+        if cx < width / 3
+
+        else
+        "right"
+        if cx > width * 2 / 3
+
+        else
+        "center"
+    )
+
+
+    vertical = (
+        "top"
+        if cy < height / 3
+
+        else
+        "bottom"
+        if cy > height * 2 / 3
+
+        else
+        "middle"
+    )
+
+
+    return (
+        f"{horizontal}-{vertical}"
+    )
+
+
+def parse_yolo_results(
+    result,
+    image,
+):
+
+    output = []
+
+
+    if (
+        result is None
+        or
+        result.boxes is None
+    ):
+
+        return output
+
+
+    width, height = (
+        image.size
+    )
+
+
+    boxes = (
+        result.boxes.xyxy
+        .detach()
+        .cpu()
+        .tolist()
+    )
+
+
+    confs = (
+        result.boxes.conf
+        .detach()
+        .cpu()
+        .tolist()
+    )
+
+
+    classes = (
+        result.boxes.cls
+        .detach()
+        .cpu()
+        .tolist()
+    )
+
+
+    names = (
+        result.names
+    )
+
+
+    for bbox, conf, cls in zip(
+        boxes,
+        confs,
+        classes,
+    ):
+
+        class_id = int(
+            cls
+        )
+
+
+        label = (
+            names[
+                class_id
+            ]
+
+            if isinstance(
+                names,
+                dict
+            )
+
+            else names[
+                class_id
+            ]
+        )
+
+
+        output.append(
+            {
+                "label":
+                    str(label),
+
+                "confidence":
+                    float(conf),
+
+                "bbox":
+                    [
+                        float(x)
+                        for x in bbox
+                    ],
+
+                "position":
+                    box_position(
+                        bbox,
+                        width,
+                        height,
+                    ),
+            }
+        )
+
+
+    output.sort(
+        key=lambda x:
+            x["confidence"],
+
+        reverse=True,
+    )
+
+
+    return output
+
+
+# ============================================================
+# 27. General YOLO Tool
+# ============================================================
+
+def run_general_yolo(
+    image,
+):
+
+    if general_yolo is None:
+
+        return []
+
+
+    result = (
+        general_yolo.predict(
+
+            source=image,
+
+            conf=(
+                GENERAL_YOLO_CONF
+            ),
+
+            imgsz=(
+                GENERAL_YOLO_IMGSZ
+            ),
+
+            verbose=False,
+
+            device=0,
+        )[0]
+    )
+
+
+    return parse_yolo_results(
+        result,
+        image,
+    )
+
+
+# ============================================================
+# 28. Material YOLO Tool
+# ============================================================
+
+def run_material_yolo(
+    image,
+):
+
+    if material_yolo is None:
+
+        return []
+
+
+    result = (
+        material_yolo.predict(
+
+            source=image,
+
+            conf=(
+                MATERIAL_YOLO_CONF
+            ),
+
+            imgsz=(
+                MATERIAL_YOLO_IMGSZ
+            ),
+
+            verbose=False,
+
+            device=0,
+        )[0]
+    )
+
+
+    return parse_yolo_results(
+        result,
+        image,
+    )
+
+
+# ============================================================
+# 29. Crop / Zoom Tool
+# ============================================================
+
+def crop_bbox(
+    image,
+    bbox,
+):
+
+    width, height = (
+        image.size
+    )
+
+
+    x1, y1, x2, y2 = bbox
+
+
+    box_w = (
+        x2 - x1
+    )
+
+
+    box_h = (
+        y2 - y1
+    )
+
+
+    pad_x = (
+        box_w
+        * CROP_PADDING_RATIO
+    )
+
+
+    pad_y = (
+        box_h
+        * CROP_PADDING_RATIO
+    )
+
+
+    x1 = max(
+        0,
+        int(
+            x1 - pad_x
+        ),
+    )
+
+
+    y1 = max(
+        0,
+        int(
+            y1 - pad_y
+        ),
+    )
+
+
+    x2 = min(
+        width,
+        int(
+            x2 + pad_x
+        ),
+    )
+
+
+    y2 = min(
+        height,
+        int(
+            y2 + pad_y
+        ),
+    )
+
+
+    if (
+        x2 <= x1
+        or
+        y2 <= y1
+    ):
+
+        return None
+
+
+    crop = image.crop(
+        (
+            x1,
+            y1,
+            x2,
+            y2,
+        )
+    )
+
+
+    # 작은 crop 확대
+    min_side = min(
+        crop.size
+    )
+
+
+    if min_side < 448:
+
+        scale = (
+            448
+            /
+            max(
+                min_side,
+                1
+            )
+        )
+
+
+        new_size = (
+
+            int(
+                crop.width
+                * scale
+            ),
+
+            int(
+                crop.height
+                * scale
+            ),
+        )
+
+
+        crop = crop.resize(
+            new_size,
+
+            Image.Resampling.BICUBIC,
+        )
+
+
+    return crop
+
+
+# ============================================================
+# 30. Tool evidence formatter
+# ============================================================
+
+def format_detections(
+    title,
+    detections,
+    limit=8,
+):
+
+    if not detections:
+
+        return (
+            f"{title}:\n"
+            "- no reliable detections"
+        )
+
+
+    lines = [
+        f"{title}:"
+    ]
+
+
+    for det in (
+        detections[
+            :limit
+        ]
+    ):
+
+        lines.append(
+
+            "- "
+            f"{det['label']} "
+            f"(confidence "
+            f"{det['confidence']:.2f}, "
+            f"position "
+            f"{det['position']})"
+        )
+
+
+    return "\n".join(
+        lines
+    )
+
+
+def build_tool_context(
+    general_results,
+    material_results,
+):
+
+    sections = []
+
+
+    if general_results is not None:
+
+        sections.append(
+
+            format_detections(
+                "General object detector",
+
+                general_results,
+            )
+        )
+
+
+    if material_results is not None:
+
+        sections.append(
+
+            format_detections(
+                "Recycling material detector",
+
+                material_results,
+            )
+        )
+
+
+    return "\n\n".join(
+        sections
+    )
+
+
+# ============================================================
+# 31. Run Tool Layer
+# ============================================================
+
+def run_visual_tools(
+    image,
+    tools,
+):
+
+    general_results = None
+
+    material_results = None
+
+
+    if (
+        "general_yolo"
+        in tools
+    ):
+
+        general_results = (
+            run_general_yolo(
+                image
+            )
+        )
+
+
+    if (
+        "material_yolo"
+        in tools
+    ):
+
+        material_results = (
+            run_material_yolo(
+                image
+            )
+        )
+
+
+    crops = []
+
+
+    if (
+        "crop"
+        in tools
+    ):
+
+        # Material detection 우선
+        candidates = []
+
+
+        if material_results:
+
+            candidates.extend(
+                material_results
+            )
+
+
+        if general_results:
+
+            candidates.extend(
+                general_results
+            )
+
+
+        # confidence 높은 순
+        candidates.sort(
+
+            key=lambda x:
+                x[
+                    "confidence"
+                ],
+
+            reverse=True,
+        )
+
+
+        for candidate in (
+            candidates[
+                :MAX_CROPS_PER_SAMPLE
+            ]
+        ):
+
+            crop = crop_bbox(
+
+                image,
+
+                candidate[
+                    "bbox"
+                ],
+            )
+
+
+            if crop is not None:
+
+                crops.append(
+                    crop
+                )
+
+
+    context = (
+        build_tool_context(
+
+            general_results,
+
+            material_results,
+        )
+    )
+
+
+    return {
+        "general":
+            general_results,
+
+        "material":
+            material_results,
+
+        "crops":
+            crops,
+
+        "context":
+            context,
+    }
+
+
+# ============================================================
+# 32. Agent prediction
+# ============================================================
+
+def agent_predict(
+    row,
+    threshold,
+):
+
+    image = load_rgb_image(
+        row["path"]
+    )
+
+
+    # --------------------------------------------------------
+    # Pass 1
+    # --------------------------------------------------------
+
+    first = internvl_predict(
+
+        row,
+
+        [image],
+    )
+
+
+    # --------------------------------------------------------
+    # Router
+    # --------------------------------------------------------
+
+    tools = route_tools(
+
+        row[
+            "question"
+        ],
+
+        first[
+            "margin"
+        ],
+
+        threshold,
+    )
+
+
+    # no tool
+    if not tools:
+
+        return {
+            "first_pred":
+                first["pred"],
+
+            "final_pred":
+                first["pred"],
+
+            "margin":
+                first["margin"],
+
+            "tools":
+                [],
+
+            "context":
+                "",
+
+            "used_second_pass":
+                False,
+        }
+
+
+    # --------------------------------------------------------
+    # Tools
+    # --------------------------------------------------------
+
+    tool_output = (
+        run_visual_tools(
+            image,
+            tools,
+        )
+    )
+
+
+    # Original image always first.
+    # Crops follow.
+    images = (
+        [image]
+        +
+        tool_output[
+            "crops"
+        ]
+    )
+
+
+    # --------------------------------------------------------
+    # Pass 2
+    # --------------------------------------------------------
+
+    second = internvl_predict(
+
+        row,
+
+        images,
+
+        extra_context=(
+            tool_output[
+                "context"
+            ]
+        ),
+    )
+
+
+    return {
+        "first_pred":
+            first["pred"],
+
+        "final_pred":
+            second["pred"],
+
+        "margin":
+            first["margin"],
+
+        "tools":
+            tools,
+
+        "context":
+            tool_output[
+                "context"
+            ],
+
+        "used_second_pass":
+            True,
+    }
+
+
+# ============================================================
+# 33. Baseline validation
+# ============================================================
+
+print(
+    "\n===== BASELINE VALIDATION ====="
+)
+
+
+baseline_rows = []
+
+
+for idx in tqdm(
+    range(
+        len(valid_subset)
+    ),
+    desc="Baseline validation",
+):
+
+    row = (
+        valid_subset.iloc[
+            idx
+        ]
+    )
+
+
+    image = load_rgb_image(
+        row["path"]
+    )
+
+
+    pred = internvl_predict(
+
+        row,
+
+        [image],
+    )
+
+
+    gold = (
+        str(
+            row["answer"]
+        )
+        .strip()
+        .lower()
+    )
+
+
+    baseline_rows.append(
+        {
+            "id":
+                row["id"],
+
+            "gold":
+                gold,
+
+            "pred":
+                pred["pred"],
+
+            "margin":
+                pred["margin"],
+
+            "correct":
+                pred["pred"]
+                == gold,
+        }
+    )
+
+
+baseline_df = pd.DataFrame(
+    baseline_rows
+)
+
+
+baseline_accuracy = (
+    baseline_df[
+        "correct"
+    ]
+    .mean()
 )
 
 
 print(
-    "\n===== TEST RATIO ====="
+    "InternVL baseline accuracy:",
+    baseline_accuracy
+)
+
+
+# ============================================================
+# 34. Tool Validation
+#
+# Maximum threshold를 사용해 candidate들에 대한
+# second pass를 미리 계산.
+# ============================================================
+
+max_threshold = max(
+    ROUTER_THRESHOLD_CANDIDATES
+)
+
+
+tool_validation_cache = []
+
+
+for idx in tqdm(
+
+    range(
+        len(valid_subset)
+    ),
+
+    desc="Tool validation",
+):
+
+    row = (
+        valid_subset.iloc[
+            idx
+        ]
+    )
+
+
+    first_data = (
+        baseline_df.iloc[
+            idx
+        ]
+    )
+
+
+    question = (
+        row[
+            "question"
+        ]
+    )
+
+
+    tools = route_tools(
+
+        question,
+
+        float(
+            first_data[
+                "margin"
+            ]
+        ),
+
+        max_threshold,
+    )
+
+
+    gold = (
+        str(
+            row[
+                "answer"
+            ]
+        )
+        .strip()
+        .lower()
+    )
+
+
+    if not tools:
+
+        tool_validation_cache.append(
+            {
+                "id":
+                    row["id"],
+
+                "gold":
+                    gold,
+
+                "first_pred":
+                    first_data[
+                        "pred"
+                    ],
+
+                "second_pred":
+                    first_data[
+                        "pred"
+                    ],
+
+                "margin":
+                    float(
+                        first_data[
+                            "margin"
+                        ]
+                    ),
+
+                "tools":
+                    "",
+
+                "context":
+                    "",
+            }
+        )
+
+        continue
+
+
+    image = load_rgb_image(
+        row["path"]
+    )
+
+
+    output = run_visual_tools(
+        image,
+        tools,
+    )
+
+
+    images = (
+        [image]
+        +
+        output[
+            "crops"
+        ]
+    )
+
+
+    second = internvl_predict(
+
+        row,
+
+        images,
+
+        extra_context=(
+            output[
+                "context"
+            ]
+        ),
+    )
+
+
+    tool_validation_cache.append(
+        {
+            "id":
+                row["id"],
+
+            "gold":
+                gold,
+
+            "first_pred":
+                first_data[
+                    "pred"
+                ],
+
+            "second_pred":
+                second[
+                    "pred"
+                ],
+
+            "margin":
+                float(
+                    first_data[
+                        "margin"
+                    ]
+                ),
+
+            "tools":
+                ",".join(
+                    tools
+                ),
+
+            "context":
+                output[
+                    "context"
+                ],
+        }
+    )
+
+
+tool_val_df = pd.DataFrame(
+    tool_validation_cache
+)
+
+
+# ============================================================
+# 35. Router threshold calibration
+# ============================================================
+
+best_threshold = (
+    ROUTER_MARGIN_THRESHOLD
+)
+
+
+best_accuracy = (
+    baseline_accuracy
+)
+
+
+if CALIBRATE_ROUTER_THRESHOLD:
+
+    print(
+        "\n===== ROUTER CALIBRATION ====="
+    )
+
+
+    for threshold in (
+        ROUTER_THRESHOLD_CANDIDATES
+    ):
+
+        final_predictions = []
+
+
+        for idx in range(
+            len(
+                tool_val_df
+            )
+        ):
+
+            item = (
+                tool_val_df.iloc[
+                    idx
+                ]
+            )
+
+
+            question = (
+                valid_subset.iloc[
+                    idx
+                ][
+                    "question"
+                ]
+            )
+
+
+            tools = route_tools(
+
+                question,
+
+                float(
+                    item[
+                        "margin"
+                    ]
+                ),
+
+                threshold,
+            )
+
+
+            if tools:
+
+                final_predictions.append(
+                    item[
+                        "second_pred"
+                    ]
+                )
+
+            else:
+
+                final_predictions.append(
+                    item[
+                        "first_pred"
+                    ]
+                )
+
+
+        accuracy = sum(
+
+            pred == gold
+
+            for pred, gold
+            in zip(
+
+                final_predictions,
+
+                tool_val_df[
+                    "gold"
+                ],
+            )
+
+        ) / len(
+            final_predictions
+        )
+
+
+        print(
+            f"threshold={threshold:.2f} "
+            f"accuracy={accuracy:.5f}"
+        )
+
+
+        if accuracy > best_accuracy:
+
+            best_accuracy = (
+                accuracy
+            )
+
+            best_threshold = (
+                threshold
+            )
+
+
+print(
+    "\nBaseline:",
+    baseline_accuracy
 )
 
 
 print(
-    pd.Series(
-        test_predictions
-    )
-    .value_counts(
-        normalize=True
-    )
-    .sort_index()
+    "Best Tool Accuracy:",
+    best_accuracy
+)
+
+
+print(
+    "Best threshold:",
+    best_threshold
 )
 
 
 # ============================================================
-# 25. Submission
+# 36. Final validation diagnostics
 # ============================================================
 
-submission = (
+final_val_rows = []
+
+
+for idx in range(
+    len(
+        tool_val_df
+    )
+):
+
+    item = (
+        tool_val_df.iloc[
+            idx
+        ]
+    )
+
+
+    question = (
+        valid_subset.iloc[
+            idx
+        ][
+            "question"
+        ]
+    )
+
+
+    tools = route_tools(
+
+        question,
+
+        float(
+            item[
+                "margin"
+            ]
+        ),
+
+        best_threshold,
+    )
+
+
+    final_pred = (
+
+        item[
+            "second_pred"
+        ]
+
+        if tools
+
+        else item[
+            "first_pred"
+        ]
+    )
+
+
+    final_val_rows.append(
+        {
+            **item.to_dict(),
+
+            "final_pred":
+                final_pred,
+
+            "correct":
+                final_pred
+                == item[
+                    "gold"
+                ],
+        }
+    )
+
+
+pd.DataFrame(
+    final_val_rows
+).to_csv(
+
+    VALIDATION_PATH,
+
+    index=False,
+)
+
+
+# ============================================================
+# 37. TEST — baseline + tools
+# ============================================================
+
+baseline_test_preds = []
+
+agent_test_preds = []
+
+tool_logs = []
+
+
+for idx in tqdm(
+
+    range(
+        len(test_df)
+    ),
+
+    desc="Test Agent",
+):
+
+    row = (
+        test_df.iloc[
+            idx
+        ]
+    )
+
+
+    image = load_rgb_image(
+        row["path"]
+    )
+
+
+    first = internvl_predict(
+
+        row,
+
+        [image],
+    )
+
+
+    baseline_test_preds.append(
+        first[
+            "pred"
+        ]
+    )
+
+
+    tools = route_tools(
+
+        row[
+            "question"
+        ],
+
+        first[
+            "margin"
+        ],
+
+        best_threshold,
+    )
+
+
+    if not tools:
+
+        final_pred = (
+            first[
+                "pred"
+            ]
+        )
+
+
+        context = ""
+
+        used_second = False
+
+
+    else:
+
+        tool_output = (
+            run_visual_tools(
+                image,
+                tools,
+            )
+        )
+
+
+        images = (
+            [image]
+            +
+            tool_output[
+                "crops"
+            ]
+        )
+
+
+        second = (
+            internvl_predict(
+
+                row,
+
+                images,
+
+                extra_context=(
+                    tool_output[
+                        "context"
+                    ]
+                ),
+            )
+        )
+
+
+        final_pred = (
+            second[
+                "pred"
+            ]
+        )
+
+
+        context = (
+            tool_output[
+                "context"
+            ]
+        )
+
+
+        used_second = True
+
+
+    agent_test_preds.append(
+        final_pred
+    )
+
+
+    tool_logs.append(
+        {
+            "id":
+                row["id"],
+
+            "first_pred":
+                first["pred"],
+
+            "first_margin":
+                first["margin"],
+
+            "tools":
+                ",".join(
+                    tools
+                ),
+
+            "used_second_pass":
+                used_second,
+
+            "final_pred":
+                final_pred,
+
+            "context":
+                context,
+        }
+    )
+
+
+# ============================================================
+# 38. Submissions
+# ============================================================
+
+SUBMISSION_DIR.mkdir(
+    parents=True,
+    exist_ok=True,
+)
+
+
+baseline_submission = (
     pd.DataFrame(
         {
             "id":
@@ -2197,48 +3309,21 @@ submission = (
                 ],
 
             "answer":
-                test_predictions,
+                baseline_test_preds,
         }
     )
 )
 
 
-if (
-    len(submission)
-    != len(test_df)
-):
+baseline_submission.to_csv(
 
-    raise RuntimeError(
-        "Submission row mismatch."
-    )
-
-
-if not set(
-    submission[
-        "answer"
-    ].unique()
-).issubset(
-    VALID_CHOICES
-):
-
-    raise RuntimeError(
-        "Invalid answer detected."
-    )
-
-
-submission.to_csv(
-
-    SUBMISSION_PATH,
+    BASELINE_SUBMISSION_PATH,
 
     index=False,
 )
 
 
-# ============================================================
-# 26. Save logits
-# ============================================================
-
-logit_output = (
+agent_submission = (
     pd.DataFrame(
         {
             "id":
@@ -2246,109 +3331,138 @@ logit_output = (
                     "id"
                 ],
 
-            "pred":
-                test_predictions,
-
-            "logit_a":
-                test_logits[
-                    :,
-                    0
-                ].numpy(),
-
-            "logit_b":
-                test_logits[
-                    :,
-                    1
-                ].numpy(),
-
-            "logit_c":
-                test_logits[
-                    :,
-                    2
-                ].numpy(),
-
-            "logit_d":
-                test_logits[
-                    :,
-                    3
-                ].numpy(),
+            "answer":
+                agent_test_preds,
         }
     )
 )
 
 
-logit_output.to_csv(
+agent_submission.to_csv(
 
-    LOGIT_PATH,
+    SUBMISSION_PATH,
+
+    index=False,
+)
+
+
+pd.DataFrame(
+    tool_logs
+).to_csv(
+
+    TOOL_LOG_PATH,
 
     index=False,
 )
 
 
 # ============================================================
-# 27. Final summary
+# 39. Diagnostics
 # ============================================================
+
+changed = sum(
+
+    a != b
+
+    for a, b
+    in zip(
+
+        baseline_test_preds,
+
+        agent_test_preds,
+    )
+)
+
 
 print(
     "\n"
-    + "=" * 60
-)
-
-print(
-    "SSAFY 8B SIMPLE BASELINE"
-)
-
-print(
-    "=" * 60
+    + "=" * 70
 )
 
 
 print(
-    "Model      :",
-    MODEL_ID
+    "SSAFY-AGENT RESULT"
+)
+
+
+print(
+    "=" * 70
+)
+
+
+print(
+    "InternVL baseline validation:",
+    baseline_accuracy
+)
+
+
+print(
+    "Tool validation:",
+    best_accuracy
+)
+
+
+print(
+    "Selected threshold:",
+    best_threshold
+)
+
+
+print(
+    "Test predictions changed:",
+    changed
+)
+
+
+print(
+    "Change ratio:",
+    changed
+    /
+    len(test_df)
+)
+
+
+print(
+    "\nBaseline submission:"
 )
 
 print(
-    "LoRA       :",
-    f"r={LORA_R}, "
-    f"alpha={LORA_ALPHA}"
+    BASELINE_SUBMISSION_PATH
+)
+
+
+print(
+    "\nAgent submission:"
 )
 
 print(
-    "Epoch      :",
-    NUM_EPOCHS
-)
-
-print(
-    "LR         :",
-    LR
-)
-
-print(
-    "Train size :",
-    len(train_subset)
-)
-
-print(
-    "Valid size :",
-    len(valid_subset)
-)
-
-print(
-    "Train loss :",
-    train_loss
-)
-
-print(
-    "Valid acc  :",
-    validation_accuracy
-)
-
-print(
-    "Submission :",
     SUBMISSION_PATH
 )
 
+
 print(
-    "=" * 60
+    "\nTool diagnostics:"
+)
+
+print(
+    TOOL_LOG_PATH
+)
+
+
+print(
+    "\nFinal distribution:"
+)
+
+
+print(
+    pd.Series(
+        agent_test_preds
+    )
+    .value_counts()
+    .sort_index()
+)
+
+
+print(
+    "=" * 70
 )
